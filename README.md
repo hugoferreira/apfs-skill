@@ -34,7 +34,7 @@ No Python packages are required. Nothing accesses the network.
 As a personal skill, available in every project:
 
 ```bash
-git clone <repository-url> ~/.claude/skills/apfs-dev
+git clone https://github.com/hugoferreira/apfs-skill.git ~/.claude/skills/apfs-dev
 ```
 
 Verify the installation (about 5 seconds, uses a throwaway directory under `$TMPDIR`):
