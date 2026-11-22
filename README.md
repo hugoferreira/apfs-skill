@@ -127,4 +127,4 @@ sh tests/run.sh --all    # plus cross-volume cases and the dedupe, transfer and 
 
 ## License
 
-No license has been chosen yet. Until a license file is added, the default copyright rules apply and reuse is not granted.
+MIT. See [LICENSE](LICENSE).
