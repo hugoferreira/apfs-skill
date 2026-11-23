@@ -1,17 +1,19 @@
 ---
 name: apfs-dev
-description: APFS techniques for agentic development on macOS - copy-on-write clones (cp -c, clonefile), instant CoW git worktrees with warm node_modules/target caches, a Claude Code WorktreeCreate hook that makes agent worktrees CoW, instant directory checkpoints and restore, deduplication of identical files into clones, transparent decmpfs compression, Time Machine local snapshots, case-sensitive or quota-limited volumes, sparse disk images, shadow overlays, RAM disks, and correct disk-space accounting (private size vs du vs df vs purgeable). Use when creating parallel worktrees or sandboxes for agents, copying large trees or dependency dirs, checkpointing before risky changes and undoing them, reclaiming disk space, diagnosing "disk full" or space that does not come back after deleting, choosing copy commands in scripts, or working with build caches on a Mac.
+description: APFS techniques for agentic development on macOS - copy-on-write clones (cp -c, clonefile), instant CoW git worktrees with warm node_modules/target caches, automatic copy-on-write worktree guidance for Codex and a Claude Code WorktreeCreate hook, instant directory checkpoints and restore, deduplication of identical files into clones, transparent decmpfs compression, Time Machine local snapshots, case-sensitive or quota-limited volumes, sparse disk images, shadow overlays, RAM disks, and correct disk-space accounting (private size vs du vs df vs purgeable). Use when creating parallel worktrees or sandboxes for agents, copying large trees or dependency dirs, checkpointing before risky changes and undoing them, reclaiming disk space, diagnosing "disk full" or space that does not come back after deleting, choosing copy commands in scripts, or working with build caches on a Mac.
 ---
 
 # APFS for agentic development
 
-Scripts are in `~/.claude/skills/apfs-dev/scripts/`: stdlib only, dry-run or read-only unless stated; each prints its manual with `--help`. All run on Python 3.9+ (`/usr/bin/python3`) except `apfs_compress_plus.py`, which needs Python 3.12+ and, to change files, `afsctool`. Shell variables do not persist between Bash tool calls, so every command below carries the full path. Measurements in this skill were taken on macOS 27.2.1 (Apple silicon, internal SSD) on 2026-11-22.
+The scripts live in `scripts/` beside this `SKILL.md`. Resolve their paths from the skill directory your agent discovered. The commands below use `APFS_DEV` for that directory. Set it to the absolute path in the shell call that runs the example, such as `APFS_DEV=~/.agents/skills/apfs-dev` for Codex or `APFS_DEV=~/.claude/skills/apfs-dev` for Claude Code.
+
+Every script prints its manual with `--help`. Use Python 3.9 or later for the standard-library scripts, and Python 3.12 or later for `apfs_compress_plus.py`. Its available backends are described in [dedup-compression.md](references/dedup-compression.md). Measurements were taken on macOS 27.2.1 with Apple silicon and an internal SSD on 2026-11-22.
 
 ## First checks
 
 ```bash
-python3 ~/.claude/skills/apfs-dev/scripts/apfs-inspect.py --can-clone SRC DEST   # exit 0 only if SRC and DEST can share blocks
-python3 ~/.claude/skills/apfs-dev/scripts/apfs-inspect.py --volume .             # fstype, clone/snapshot/case-sensitivity support, free space
+python3 "$APFS_DEV"/scripts/apfs-inspect.py --can-clone SRC DEST   # exit 0 only if SRC and DEST can share blocks
+python3 "$APFS_DEV"/scripts/apfs-inspect.py --volume .             # fstype, clone/snapshot/case-sensitivity support, free space
 ```
 
 - Clones only work within one APFS volume. Across volumes (another volume in the same container, an external disk, a disk image, a RAM disk) every "clone" silently becomes a full copy. Keep sources, worktrees, caches and checkpoints on one volume. On a standard Mac `~`, `/private/tmp` and `$TMPDIR` are all on the Data volume.
@@ -26,6 +28,7 @@ python3 ~/.claude/skills/apfs-dev/scripts/apfs-inspect.py --volume .            
 | New worktree for a parallel agent, zero extra space | `apfs-worktree.py SRC DEST [-b NEW_BRANCH \| --checkout BRANCH]` | [worktrees.md](references/worktrees.md) |
 | Same, with node_modules/target/dist/.env already populated | `apfs-worktree.py SRC DEST --warm --fast-index` | [worktrees.md](references/worktrees.md) |
 | Fork the current uncommitted state (same `git status`) | `apfs-worktree.py SRC DEST --wip` | [worktrees.md](references/worktrees.md) |
+| Automatically use CoW for worktrees created by Codex, including under `/private/tmp` | Add the worktree policy to an active `AGENTS.md` | [codex-agents.md](references/codex-agents.md) |
 | Make Claude Code's own worktrees (`--worktree`, subagent isolation) CoW and warm | `WorktreeCreate` hook running `claude-worktree-hook.py` | [claude-code.md](references/claude-code.md) |
 | Checkpoint a directory before a risky step, restore later | `apfs-checkpoint.py create/diff/restore/drop DIR` | [snapshots.md](references/snapshots.md) |
 | Whole-volume point-in-time | `tmutil localsnapshot` (no restore API without entitlements) | [snapshots.md](references/snapshots.md) |
@@ -62,33 +65,33 @@ cp -ac node_modules ../other-checkout/node_modules
 
 ```bash
 # CoW worktree for an agent (tracked files cloned, verified against REF)
-python3 ~/.claude/skills/apfs-dev/scripts/apfs-worktree.py . ../wt-agent1 -b agent1
-python3 ~/.claude/skills/apfs-dev/scripts/apfs-worktree.py . ../wt-agent2 -b agent2 --warm --fast-index   # with ignored caches
-python3 ~/.claude/skills/apfs-dev/scripts/apfs-worktree.py . ../wt-fix --checkout existing-branch --require-clone
+python3 "$APFS_DEV"/scripts/apfs-worktree.py . ../wt-agent1 -b agent1
+python3 "$APFS_DEV"/scripts/apfs-worktree.py . ../wt-agent2 -b agent2 --warm --fast-index   # with ignored caches
+python3 "$APFS_DEV"/scripts/apfs-worktree.py . ../wt-fix --checkout existing-branch --require-clone
 git worktree remove --force ../wt-agent1 && git branch -d agent1                                          # cleanup
 ```
 
 ```bash
 # checkpoint / restore a directory (keeps the current .git unless --with-git)
-python3 ~/.claude/skills/apfs-dev/scripts/apfs-checkpoint.py create "$PWD" -m "before migration"
-python3 ~/.claude/skills/apfs-dev/scripts/apfs-checkpoint.py diff "$PWD"       # M/A/D/T path, relative to the checkpoint
-python3 ~/.claude/skills/apfs-dev/scripts/apfs-checkpoint.py restore "$PWD" && cd "$PWD"
-python3 ~/.claude/skills/apfs-dev/scripts/apfs-checkpoint.py drop "$PWD" --all
+python3 "$APFS_DEV"/scripts/apfs-checkpoint.py create "$PWD" -m "before migration"
+python3 "$APFS_DEV"/scripts/apfs-checkpoint.py diff "$PWD"       # M/A/D/T path, relative to the checkpoint
+python3 "$APFS_DEV"/scripts/apfs-checkpoint.py restore "$PWD" && cd "$PWD"
+python3 "$APFS_DEV"/scripts/apfs-checkpoint.py drop "$PWD" --all
 ```
 
 `restore` without an ID always returns to the newest checkpoint made with `create`, however many restores came before; each restore saves the replaced state as `pre-restore-*` (undo with `restore DIR pre-restore-...`, reclaim with `drop DIR --pre-restore`).
 
 ```bash
 # what does it really cost?
-python3 ~/.claude/skills/apfs-dev/scripts/apfs-inspect.py file1 file2
-python3 ~/.claude/skills/apfs-dev/scripts/apfs-inspect.py --tree ~/Development --json
-python3 ~/.claude/skills/apfs-dev/scripts/apfs-inspect.py --families some/dir
+python3 "$APFS_DEV"/scripts/apfs-inspect.py file1 file2
+python3 "$APFS_DEV"/scripts/apfs-inspect.py --tree ~/Development --json
+python3 "$APFS_DEV"/scripts/apfs-inspect.py --families some/dir
 ```
 
 ```bash
 # dedupe / compression (dry runs by default)
-python3 ~/.claude/skills/apfs-dev/scripts/apfs-dedupe.py ~/Development --top 10
-python3 ~/.claude/skills/apfs-dev/scripts/apfs_compress_plus.py file scan ~/Archive
+python3 "$APFS_DEV"/scripts/apfs-dedupe.py ~/Development --top 10
+python3 "$APFS_DEV"/scripts/apfs_compress_plus.py file scan ~/Archive
 ```
 
 ## Symptoms
@@ -127,11 +130,11 @@ Keep the scripts in one directory; they import each other by path.
 Tests, all on throwaway fixtures under `$TMPDIR`:
 
 ```bash
-sh ~/.claude/skills/apfs-dev/tests/run.sh          # inspect, worktree, checkpoint, hook, apfs_common (about 5 s)
+sh "$APFS_DEV"/tests/run.sh          # inspect, worktree, checkpoint, hook, apfs_common (about 5 s)
 ```
 
 ```bash
-sh ~/.claude/skills/apfs-dev/tests/run.sh --all    # plus cross-volume cases and the dedupe, transfer and compression suites (about 1 min)
+sh "$APFS_DEV"/tests/run.sh --all    # plus cross-volume cases and the dedupe, transfer and compression suites (about 1 min)
 ```
 
 `PYTHON=/usr/bin/python3 sh .../run.sh` selects the interpreter (the compression suite is skipped below 3.12). Run the tests after editing a script or upgrading macOS.

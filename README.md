@@ -1,8 +1,8 @@
 # apfs-dev
 
-A [Claude Code](https://claude.com/claude-code) skill that teaches an agent to use APFS on macOS: copy-on-write clones, instant git worktrees and directory checkpoints, correct disk-space accounting, deduplication, and transparent compression. It ships the scripts that do the work, the reference notes behind them, and their tests.
+A skill for [Claude Code](https://claude.com/claude-code) and [Codex](https://chatgpt.com/codex) that teaches an agent to use APFS on macOS: copy-on-write clones, instant git worktrees and directory checkpoints, correct disk-space accounting, deduplication, and transparent compression. It ships the scripts that do the work, the reference notes behind them, and their tests.
 
-The scripts are plain command-line tools. They work without Claude Code.
+The scripts are standalone command-line tools.
 
 ## What it provides
 
@@ -31,40 +31,56 @@ No Python packages are required. Nothing accesses the network.
 
 ## Install
 
-As a personal skill, available in every project:
+### Claude Code
 
 ```bash
 git clone https://github.com/hugoferreira/apfs-skill.git ~/.claude/skills/apfs-dev
-```
-
-Verify the installation (about 5 seconds, uses a throwaway directory under `$TMPDIR`):
-
-```bash
 sh ~/.claude/skills/apfs-dev/tests/run.sh
 ```
 
-Claude Code discovers the skill on its next start. It loads it when a task matches the description in `SKILL.md` (worktrees, large copies, checkpoints, disk space, build caches on a Mac), or on request with `/apfs-dev`.
+Claude Code discovers the skill on its next start. Use `/apfs-dev` to invoke it explicitly.
 
-The commands in `SKILL.md` and `references/` are written with the path `~/.claude/skills/apfs-dev/scripts/`. The scripts themselves run from any location, because each finds its sibling modules relative to its own file. If you install the skill elsewhere (for example in a project's `.claude/skills/`), adjust the paths in the documents or symlink the directory to the personal location.
+### Codex
+
+For a standalone Codex install, clone into the personal skills directory.
+
+```bash
+mkdir -p ~/.agents/skills
+git clone https://github.com/hugoferreira/apfs-skill.git ~/.agents/skills/apfs-dev
+sh ~/.agents/skills/apfs-dev/tests/run.sh
+```
+
+If you already installed it for Claude Code, share that checkout with Codex. Run this only when `~/.agents/skills/apfs-dev` is free.
+
+```bash
+mkdir -p ~/.agents/skills
+ln -s ~/.claude/skills/apfs-dev ~/.agents/skills/apfs-dev
+```
+
+Use `$apfs-dev` to invoke the skill explicitly. For automatic use on agent-created worktrees, add the [Codex worktree instructions](references/codex-agents.md) to `~/.codex/AGENTS.md`, or to the active `AGENTS.override.md` if you use one. For project-only use, add them to the project's `AGENTS.md`. The instructions cover temporary worktrees under `/private/tmp`, branch and ref selection, and APFS clone verification. Open a fresh session to load the instructions. [Codex instruction discovery](https://learn.chatgpt.com/docs/agent-configuration/agents-md)
+
+The desktop app's **Worktree** control checks out the repository before setup scripts run. To use APFS cloning for the checkout itself, have Codex create the worktree through this skill and open that checkout as a local project. [Codex worktrees](https://learn.chatgpt.com/docs/environments/git-worktrees) · [Local environment setup](https://learn.chatgpt.com/docs/environments/local-environment#setup-scripts)
 
 ## Using the scripts directly
 
 ```bash
+APFS_DEV=~/.agents/skills/apfs-dev # or ~/.claude/skills/apfs-dev
+
 # Can two paths share blocks? What does this volume support?
-python3 ~/.claude/skills/apfs-dev/scripts/apfs-inspect.py --can-clone . ../wt-1
-python3 ~/.claude/skills/apfs-dev/scripts/apfs-inspect.py --volume .
+python3 "$APFS_DEV"/scripts/apfs-inspect.py --can-clone . ../wt-1
+python3 "$APFS_DEV"/scripts/apfs-inspect.py --volume .
 
 # A worktree made of clones, on a new branch, with ignored caches
-python3 ~/.claude/skills/apfs-dev/scripts/apfs-worktree.py . ../wt-1 -b agent/1 --warm
+python3 "$APFS_DEV"/scripts/apfs-worktree.py . ../wt-1 -b agent/1 --warm
 
 # Checkpoint, inspect changes, restore
-python3 ~/.claude/skills/apfs-dev/scripts/apfs-checkpoint.py create "$PWD" -m baseline
-python3 ~/.claude/skills/apfs-dev/scripts/apfs-checkpoint.py diff "$PWD"
-python3 ~/.claude/skills/apfs-dev/scripts/apfs-checkpoint.py restore "$PWD" && cd "$PWD"
+python3 "$APFS_DEV"/scripts/apfs-checkpoint.py create "$PWD" -m baseline
+python3 "$APFS_DEV"/scripts/apfs-checkpoint.py diff "$PWD"
+python3 "$APFS_DEV"/scripts/apfs-checkpoint.py restore "$PWD" && cd "$PWD"
 
 # Duplicates and compression: both preview by default
-python3 ~/.claude/skills/apfs-dev/scripts/apfs-dedupe.py ~/code --top 10
-python3 ~/.claude/skills/apfs-dev/scripts/apfs_compress_plus.py file scan ~/Archive
+python3 "$APFS_DEV"/scripts/apfs-dedupe.py ~/code --top 10
+python3 "$APFS_DEV"/scripts/apfs_compress_plus.py file scan ~/Archive
 ```
 
 Every script prints its manual with `--help`.
@@ -102,8 +118,8 @@ Limits that apply throughout: open-file detection sees only the current user's p
 
 | Path | Content |
 |---|---|
-| `SKILL.md` | What Claude reads first: checks, decision table, rules, symptoms, common commands |
-| `references/` | One file per topic: clones, worktrees, snapshots and checkpoints, space accounting, volumes and disk images, dedupe and compression, the dedupe/transfer manual, Claude Code integration |
+| `SKILL.md` | Checks, decision table, rules, symptoms, and common commands for agents |
+| `references/` | One file per topic: clones, worktrees, snapshots and checkpoints, space accounting, volumes and disk images, dedupe and compression, the dedupe/transfer manual, and Claude Code and Codex integration |
 | `scripts/apfs_common.py` | Shared module: all libSystem bindings (clonefile, copyfile, renamex_np, getattrlist, statfs, xattr, ACL, libproc) and common helpers |
 | `scripts/apfs_job.py` | Job state for long runs: lock, status, pause/resume/stop, checkpoints |
 | `scripts/*.py` | The tools listed above; keep them in one directory |
