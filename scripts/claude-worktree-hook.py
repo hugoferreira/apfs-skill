@@ -143,7 +143,10 @@ def remove(data, args):
     branch = git(real, 'symbolic-ref', '--short', '-q', 'HEAD')[1]
     rc, head = git(real, 'rev-parse', '--verify', '-q', 'HEAD')
     if not force:
-        dirty = git(real, 'status', '--porcelain')[1]
+        # Explicit, so status.showUntrackedFiles=no cannot hide untracked work.
+        status, dirty = git(real, 'status', '--porcelain', '--untracked-files=all')
+        if status != 0:
+            sys.exit(f'error: git status failed in {path}; worktree kept')
         if dirty:
             lines = dirty.split('\n')
             sys.exit(f'error: {path} has {len(lines)} uncommitted or untracked path(s), e.g. '

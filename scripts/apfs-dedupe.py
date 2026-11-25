@@ -21,13 +21,13 @@ import sqlite3
 import tempfile
 from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from apfs_common import (EF_SHARES_ALL_BLOCKS, PROVENANCE_XATTR, STAGE_PAYLOAD, STAGING_PREFIXES,
-                         UF_COMPRESSED, UNSAFE_FLAGS,
+from apfs_common import (EF_SHARES_ALL_BLOCKS, PROVENANCE_XATTR, SF_DATALESS, STAGE_PAYLOAD,
+                         STAGING_PREFIXES, UF_COMPRESSED, UNSAFE_FLAGS,
                          XATTR_NOFOLLOW, Conflict, Native, allocated_bytes, file_checkpoint,
                          free_bytes, hash_fd, human_bytes, lstat_or_none, make_private_stage,
-                         matches_checkpoint, metadata_digest, private_stage_directory,
-                         remove_private_stage, safe_path, signature, sync_dir, sync_file,
-                         tracked_staging_path, unchanged)
+                         matches_checkpoint, metadata_digest, on_device, private_stage_directory,
+                         remove_orphan_stage, remove_private_stage, safe_path, signature,
+                         sync_dir, sync_file, tracked_staging_path, unchanged)
 from apfs_job import Job, Progress, control, default_state
 
 VERSION = '1.7.0'
@@ -50,8 +50,9 @@ class Skip(Conflict):
 
 
 def eligible(s):
+    # Hashing a dataless (iCloud, File Provider) file would download it.
     return (stat.S_ISREG(s.st_mode) and s.st_nlink == 1 and s.st_size > 0
-            and s.st_uid == os.geteuid() and not s.st_flags & UNSAFE_FLAGS
+            and s.st_uid == os.geteuid() and not s.st_flags & (UNSAFE_FLAGS | SF_DATALESS)
             and not s.st_mode & 0o6000)
 
 
@@ -156,9 +157,34 @@ def validate_journal_file(fd):
     return s
 
 
+def root_identity(root):
+    """{'uuid', 'root_inode'}: the volume and inode of the root directory, or None."""
+    try:
+        return Native().volume_identity(root)
+    except (OSError, ValueError):
+        return None
+
+
 def validate_header(records, root):
-    if records and records[0] != {'event': 'header', 'version': 1, 'root': str(root)}:
-        raise Conflict('Journal belongs to another root or version')
+    """Require the journal of this root.
+
+    A header with 'volume' is bound to the root directory by volume UUID and
+    inode, so a renamed or remounted root keeps its journal. Older headers
+    are bound to the root path.
+    """
+    if not records:
+        return
+    header = records[0]
+    expected = {'event': 'header', 'version': 1, 'root': str(root)}
+    bound = header.get('volume') if isinstance(header, dict) else None
+    if bound:
+        valid = ({**header, 'root': str(root)} == {**expected, 'volume': bound}
+                 and bound == root_identity(root))
+    else:
+        valid = header == expected
+    if not valid:
+        raise Conflict('Journal belongs to another root or version. '
+                       'If this tree is a copy of a deduplicated tree, delete the copied journal')
 
 
 def journal_records(fd, compressed, on_record=None):
@@ -385,7 +411,11 @@ class Journal:
                 os.fsync(self.fd)
             os.lseek(self.fd, 0, os.SEEK_END)
             if not self.records:
-                self.add(event='header', version=1, root=str(root))
+                header = dict(event='header', version=1, root=str(root))
+                identity = root_identity(root)
+                if identity:
+                    header['volume'] = identity
+                self.add(**header)
                 sync_dir(path.parent)
         except BaseException:
             os.close(self.fd)
@@ -435,6 +465,18 @@ class Journal:
             elif r['event'] == 'aborted':
                 pending.pop(r['id'], None)
         native = Native() if pending else None
+        # Device numbers change with attach order. The job identity or the
+        # journal header has matched the volume UUID, so recorded identities
+        # are read with the root's current device.
+        header = self.records[0] if self.records else None
+        same_volume = self.job is not None or bool(header and header.get('volume'))
+        device = self.root.stat().st_dev if pending else None
+        for r in pending.values():
+            recorded = r.get('staging_directory')
+            if same_volume and recorded and recorded[0] != device:
+                r['staging_directory'] = on_device(recorded, device)
+                for key in ('original', 'prepared'):
+                    r[key] = on_device(r.get(key), device)
         for ident, r in list(pending.items()):
             dst = safe_path(self.root, r['destination'])
             name, tmp = tracked_staging_path(native, self.root, dst, r, PREFIX)
@@ -674,7 +716,8 @@ def publish(native, journal, batch, cache=None):
             try:
                 if tuple(item.expected[:2]) in busy:
                     raise Skip('Open in another process', item.dst)
-                # Held only across the exchange; a cooperating flock holder wins.
+                # Held until the exchange is confirmed or marked for reversal;
+                # a cooperating flock holder wins.
                 try:
                     fcntl.flock(item.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
@@ -703,6 +746,11 @@ def publish(native, journal, batch, cache=None):
                     reverting.append((item, 'Changed during replacement'))
             except OSError as e:
                 reverting.append((item, 'Replacement could not be confirmed (' + (e.strerror or str(e)) + ')'))
+        for item in batch:
+            try:
+                fcntl.flock(item.fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
         if reverting:
             busy = native.open_files(mappings=False)
         for item, reason in reverting:
@@ -1025,7 +1073,7 @@ def print_summary(result, top):
         print('Dry run; use --apply to replace files. Physical savings may be lower.')
 
 
-def scan(root, minimum, exclusions, journal_path, progress, native, skip):
+def scan(root, minimum, exclusions, journal_path, progress, native, skip, stages=None):
     """Group eligible files by content and provenance.
 
     The tree may change during the scan: entries that disappear are ignored,
@@ -1045,6 +1093,8 @@ def scan(root, minimum, exclusions, journal_path, progress, native, skip):
         return s is not None and stat.S_ISDIR(s.st_mode) and s.st_dev == device
     for directory, dirs, files in os.walk(root, followlinks=False, onerror=walk_error):
         directories += 1
+        if stages is not None:
+            stages.extend(Path(directory) / n for n in dirs if n.startswith(PREFIX))
         dirs[:] = sorted(n for n in dirs if n not in exclusions and not n.startswith(STAGING_PREFIXES)
                          and descend(Path(directory) / n))
         for name in sorted(files):
@@ -1293,7 +1343,13 @@ def main(argv=None):
         origins = {}
         if job and (args.apply or read_path.exists()):
             origins = SignatureMap(DiskRecords(job), 'origin')
-        groups, scanned, excluded, unmatched = scan(root, args.min_size, {'.git', *args.exclude}, jp, progress, native, skip)
+        stages = [] if args.apply else None
+        groups, scanned, excluded, unmatched = scan(root, args.min_size, {'.git', *args.exclude}, jp, progress,
+                                                    native, skip, stages)
+        # Recovery has settled every journaled stage. An empty directory left
+        # is from a run that died between mkdir and its journal record.
+        for stage in stages or ():
+            remove_orphan_stage(stage)
         planned, tasks = [], []
         progress.start('Planning replacements', sum(len(paths) - 1 for _, paths in groups),
                        sum(key[0] * (len(paths) - 1) for key, paths in groups))

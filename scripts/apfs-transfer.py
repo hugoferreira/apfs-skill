@@ -12,11 +12,11 @@ import tempfile
 import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from apfs_common import (COPYFILE_ALL, COPYFILE_CLONE, COPYFILE_EXCL, COPYFILE_METADATA,
-                         COPYFILE_NOFOLLOW, PROVENANCE_XATTR, STAGE_PAYLOAD, STAGING_PREFIXES,
+                         COPYFILE_NOFOLLOW, EMPTY_ACL, PROVENANCE_XATTR, STAGE_PAYLOAD, STAGING_PREFIXES,
                          UF_COMPRESSED, UNSAFE_FLAGS, Conflict, Native, allocated_bytes, hash_fd,
-                         make_private_stage, metadata_digest, private_stage_directory,
-                         remove_private_stage, safe_path, signature, sync_dir, sync_file,
-                         tracked_staging_path)
+                         make_private_stage, metadata_digest, on_device, private_stage_directory,
+                         remove_orphan_stage, remove_private_stage, safe_path, signature, sync_dir,
+                         sync_file, tracked_staging_path)
 from apfs_job import Job, Progress, control, default_state
 
 PREFIX = '.apfs-transfer-stage-'
@@ -104,6 +104,51 @@ def ensure_unchanged(path, expected):
         raise Conflict('Changed since checkpoint: ' + str(path))
 
 
+# A dedupe journal is bound to the root it was written in and is not valid in a copy.
+DEDUPE_JOURNALS = ('.apfs-dedupe.jsonl.gz', '.apfs-dedupe.jsonl')
+
+
+def rebase_devices(job, source, destination):
+    """Read checkpoints recorded under other device numbers with the current ones.
+
+    Device numbers follow attach order, so a remount or reboot changes them.
+    The job identity has already matched both volume UUIDs.
+    """
+    current = [source.stat().st_dev, destination.stat().st_dev]
+    db = job.db
+    row = db.execute("SELECT value FROM cache WHERE kind='devices' AND path=''").fetchone()
+    if row and json.loads(row[0]) == current:
+        return
+    src, dst = current
+    rows = db.execute("SELECT kind,path,signature,value FROM cache "
+                      "WHERE kind IN ('done','pending','sha256','destination-sha256')").fetchall()
+    for kind, path, raw_signature, raw_value in rows:
+        recorded, value = json.loads(raw_signature), json.loads(raw_value)
+        if kind == 'done':
+            recorded = [on_device(recorded[0], src), on_device(recorded[1], dst)]
+        elif kind == 'sha256':
+            recorded = on_device(recorded, src)
+        elif kind == 'destination-sha256':
+            recorded = on_device(recorded, dst)
+        else:
+            for key, device in (('source_signature', src), ('prepared', dst), ('staging_directory', dst)):
+                if value.get(key):
+                    value[key] = on_device(value[key], device)
+        db.execute('UPDATE cache SET signature=?,value=? WHERE kind=? AND path=?',
+                   (json.dumps(recorded), json.dumps(value), kind, path))
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='keepers'").fetchone():
+        for key, path, raw_signature in db.execute('SELECT key,path,signature FROM keepers').fetchall():
+            renamed = key
+            if key.startswith('inode:'):
+                # Keys of hard-link keepers hold the source [device, inode].
+                renamed = 'inode:' + str(on_device(json.loads(key[6:]), src))
+            db.execute('DELETE FROM keepers WHERE key=?', (key,))
+            db.execute('INSERT OR REPLACE INTO keepers VALUES (?,?,?)',
+                       (renamed, path, json.dumps(on_device(json.loads(raw_signature), dst))))
+    job.put('devices', '', [], current)
+    job.flush()
+
+
 def recover(job, destination, native, progress):
     """Settle files that an interrupted run left staged or just published."""
     for rel, raw in job.db.execute("SELECT path,value FROM cache WHERE kind='pending'").fetchall():
@@ -167,6 +212,8 @@ def manifest(job, source, exclusions, progress):
                 continue
             if name != '.' and path.is_dir() and not path.is_symlink():
                 continue
+            if name in DEDUPE_JOURNALS and not path.is_symlink():
+                continue
             progress.checkpoint()
             s = path.lstat()
             if s.st_dev != device:
@@ -210,7 +257,27 @@ class Transfer:
             path = safe_path(self.destination, rel)
             if exists(path) and (path.is_symlink() or not path.is_dir()):
                 raise Conflict('Destination directory conflict: ' + str(path))
-            path.mkdir(exist_ok=True)
+            try:
+                # Owner-only until restore_directories applies the source
+                # mode and ACL, so a private source directory is never
+                # readable by others at the destination.
+                path.mkdir(mode=0o700)
+            except FileExistsError:
+                # recover() has settled journaled stages; an empty one is
+                # from a run that died between mkdir and its record.
+                with os.scandir(path) as entries:
+                    orphans = [entry.path for entry in entries if entry.name.startswith(PREFIX)]
+                for orphan in orphans:
+                    remove_orphan_stage(Path(orphan))
+                continue
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                if stat.S_IMODE(os.fstat(fd).st_mode) != 0o700:
+                    os.fchmod(fd, 0o700)
+                if self.native.acl(path, nofollow=True) != EMPTY_ACL:
+                    self.native.clear_fd_acl(fd)
+            finally:
+                os.close(fd)
 
     def completed(self, rel, kind, src, dst, source_sig, dest_sig):
         """Result of an earlier run that still describes src and dst, else None."""
@@ -399,6 +466,7 @@ def run(args, source, destination, state):
         except BlockingIOError:
             raise Conflict('Destination is locked by another process: ' + str(destination)) from None
         progress = Progress(args.quiet, job)
+        rebase_devices(job, source, destination)
         recover(job, destination, native, progress)
         files, size = manifest(job, source, exclusions, progress)
         progress.start('Copying and verifying', files, size)

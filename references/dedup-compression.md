@@ -21,7 +21,7 @@ Darwin can hide an independent resource fork on a file whose compressed payload 
 
 Staged compression uses a durable per-file journal and `RENAME_SWAP`. The tool rechecks the displaced original's APFS generation and metadata, including xattrs and ACLs. If the original changed or was opened during the exchange, the tool restores it when the installed copy is still unchanged. It keeps both versions when either could be lost during rollback.
 
-If compression reports a pending publication, inspect and recover that file or tree before retrying. Keep the private stage until recovery is complete. If recovery reports a conflict, compare both paths it names and retain the desired versions before clearing the stage.
+A killed run can leave a private stage beside a file. `file compress` settles such a stage before it starts when no process holds it: the original returns to its path if the exchange was not confirmed, and the staged copy is removed. `SIGTERM` and `SIGHUP` stop a run like an interrupt, after the files in progress clear their stages. If compression still reports a pending publication, the stage needs review: both versions may have changed. Compare both paths the error names and retain the desired versions before clearing the stage.
 
 ```bash
 python3 "$APFS_DEV"/scripts/apfs_compress_plus.py file repair ROOT --only interrupted_swap --dry-run --json
@@ -93,7 +93,7 @@ Tools:
 
 Cloning a compressed file shares the compressed blocks and keeps the compression flag. Compression scans and apply runs skip files with shared APFS blocks, because compressing one member of a clone family allocates a new compressed stream while the other members keep the old blocks. A saved plan rechecks sharing when applied. Structured output counts these files under `skipped_shared_blocks`.
 
-To combine both techniques for exact duplicates, compress before deduplication, as `apfs-reclaim.py` does, or compress one independent copy and let dedupe choose it as the keeper if it uses less space. Clones of a compressed keeper share the compressed blocks. Old extents are freed when their last reference is gone, including references outside the scanned tree. The staged `ditto` backend only publishes a compressed copy if it uses less space than the source's private allocation.
+To combine both techniques for exact duplicates, compress before deduplication, as `apfs-reclaim.py` does, or compress one independent copy and let dedupe choose it as the keeper if it uses less space. Clones of a compressed keeper share the compressed blocks. Old extents are freed when their last reference is gone, including references outside the scanned tree. The staged `ditto` backend only publishes a compressed copy if it uses less space than the source.
 
 ## Sources
 

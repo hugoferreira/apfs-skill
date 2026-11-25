@@ -293,20 +293,6 @@ finally:
         self.cli('--apply')
         self.assertEqual((self.dest / 'a').read_bytes(), content)
         self.assertEqual((self.dest / 'b').read_bytes(), content)
-        self.assertEqual(t.metadata(self.native, a), t.metadata(self.native, self.dest / 'a'))
-
-    def test_compressed_transfer(self):
-        import struct, zlib
-        self.pair()
-        a = self.source / 'a'
-        content = a.read_bytes()
-        a.write_bytes(b'')
-        value = struct.pack('<IIQ', 0x636d7066, 3, len(content)) + zlib.compress(content)
-        self.native.set_xattr(a,'com.apple.decmpfs',value)
-        os.chflags(a, c.UF_COMPRESSED)
-        self.cli('--apply')
-        self.assertEqual((self.dest / 'a').read_bytes(), content)
-        self.assertEqual((self.dest / 'b').read_bytes(), content)
         self.assertTrue((self.dest / 'a').stat().st_flags & c.UF_COMPRESSED)
         self.assertEqual(t.metadata(self.native, a), t.metadata(self.native, self.dest / 'a'))
 
@@ -464,6 +450,49 @@ finally:
                 self.assertEqual(result.returncode, 0)
                 self.assertIn('--control', result.stdout)
                 self.assertEqual(result.stderr, '')
+
+    def test_resume_after_device_numbers_change(self):
+        self.pair()
+        os.link(self.source / 'a', self.source / 'linked')
+        self.assertEqual(self.cli('--apply')['copied_files'], 3)
+        db = sqlite3.connect(self.state / 'checkpoints.sqlite3')
+        # Checkpoints as an earlier attach order would have recorded them.
+        for kind, path, raw in db.execute("SELECT kind,path,signature FROM cache WHERE kind IN "
+                                          "('done','sha256','destination-sha256')").fetchall():
+            recorded = json.loads(raw)
+            recorded = ([[x[0] + 7, *x[1:]] for x in recorded] if kind == 'done'
+                        else [recorded[0] + 7, *recorded[1:]])
+            db.execute('UPDATE cache SET signature=? WHERE kind=? AND path=?', (json.dumps(recorded), kind, path))
+        db.execute("UPDATE cache SET value='[1, 2]' WHERE kind='devices'")
+        db.commit()
+        db.close()
+        result = self.cli('--apply')
+        self.assertEqual((result['copied_files'], result['resumed_files']), (0, 3))
+
+    def test_dedupe_journal_is_not_transferred(self):
+        self.pair()
+        (self.source / '.apfs-dedupe.jsonl.gz').write_bytes(b'journal of the source root')
+        self.cli('--apply')
+        self.assertFalse((self.dest / '.apfs-dedupe.jsonl.gz').exists())
+        self.assertTrue((self.dest / 'a').exists())
+
+    def test_new_destination_directories_are_private_until_restored(self):
+        private = self.source / 'private'
+        private.mkdir()
+        (private / 'f').write_bytes(b'x' * 100)
+        private.chmod(0o755)
+        args = type('Args', (), dict(apply=True, quiet=True, exclude=[], exclude_system=False,
+                                     replace=False, verify_all=False))()
+        real, seen = t.Transfer.copy_files, []
+
+        def copy_files(transfer):
+            seen.append((self.dest / 'private').stat().st_mode & 0o777)
+            real(transfer)
+
+        with mock.patch.object(t.Transfer, 'copy_files', copy_files):
+            t.run(args, self.source, self.dest, self.state)
+        self.assertEqual(seen, [0o700])
+        self.assertEqual((self.dest / 'private').stat().st_mode & 0o777, 0o755)
 
     def test_switching_journals_invalidates_the_shared_index(self):
         self.pair()

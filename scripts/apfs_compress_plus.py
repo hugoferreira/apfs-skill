@@ -21,6 +21,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -55,7 +56,7 @@ if sys.version_info < MIN_PYTHON:
     sys.exit(EXIT_UNSUPPORTED)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from apfs_common import (DECMPFS_XATTR, EF_MAY_SHARE_BLOCKS, EF_SHARES_ALL_BLOCKS,  # noqa: E402
-                         PROVENANCE_XATTR, STAGING_PREFIXES, UNSAFE_FLAGS, Conflict,
+                         PROVENANCE_XATTR, SF_DATALESS, STAGING_PREFIXES, UNSAFE_FLAGS, Conflict,
                          XATTR_NOFOLLOW, Native, OpenUse, atomic_write,
                          free_bytes, human_bytes, signature)
 from apfs_publish import (PUBLICATION_PREFIX, PublicationConflict, publication_directory,
@@ -2081,11 +2082,15 @@ class OpenFiles:
         self._taken = None
         self._users = {}
 
-    def busy(self, paths) -> dict:
-        """Return {path: users} for paths that other processes can write."""
+    def busy(self, paths, fresh: bool = False) -> dict:
+        """Return {path: users} for paths that other processes can write.
+
+        fresh=True takes a new snapshot. Use it directly before a write in
+        place, where a writer missed by an older snapshot loses data.
+        """
         with self._lock:
             now = time.monotonic()
-            if (self._taken is None or
+            if (fresh or self._taken is None or
                     now - self._taken > self.REFRESH_SECONDS):
                 self._users = snapshot_open_files()
                 self._taken = now
@@ -2105,7 +2110,7 @@ OPEN_FILES = OpenFiles()
 
 
 def require_unused(path: Path) -> None:
-    users = OPEN_FILES.busy([path]).get(path)
+    users = OPEN_FILES.busy([path], fresh=True).get(path)
     if users:
         raise FileInUseError(path, users)
 
@@ -2139,12 +2144,22 @@ def replace_unchanged_source(publication, original: os.stat_result) -> None:
 
 
 def require_settled_publication(stage: Path) -> None:
-    if os.path.lexists(stage):
+    """Recover a stage left by an interrupted run; fail if it needs review.
+
+    A stage that another process holds locked is in use and is not touched.
+    """
+    if not os.path.lexists(stage):
+        return
+    try:
+        recover_publication(native(), stage)
+    except (OSError, RuntimeError, Conflict, ValueError, TypeError,
+            KeyError) as exc:
         raise AppError(
-            "publication_pending", f"Compression recovery stage exists: {stage}",
+            "publication_pending",
+            f"Compression recovery stage needs review: {stage} ({exc})",
             EXIT_CONFLICT, "run file repair --only interrupted_swap for the affected path",
             path=str(stage),
-        )
+        ) from exc
 
 
 def is_mach_o(path: Path) -> bool:
@@ -2380,9 +2395,7 @@ def ditto_compress_file(path: Path) -> bool:
     if (not stat.S_ISREG(original.st_mode) or original.st_nlink != 1
             or original.st_flags & UNSAFE_FLAGS or original.st_mode & 0o6000):
         raise RuntimeError("source is no longer eligible for atomic replacement")
-    original_sharing = fs.sharing(path)
-    if original_sharing.private == 0:
-        return False
+    require_unshared_blocks(path)
     with staged_replacement(fs, path) as publication:
         temporary = publication.payload
         command = [*BASE, str(path.absolute()), temporary.name]
@@ -2397,11 +2410,7 @@ def ditto_compress_file(path: Path) -> bool:
             if not fs.decmpfs(temporary):
                 return False
             restore_compressed_flag(temporary)
-        private = fs.sharing(path).private
-        reclaimable = allocated_size(original)
-        if private is not None:
-            reclaimable = min(reclaimable, private)
-        if allocated_size(temporary.stat()) >= reclaimable:
+        if allocated_size(temporary.stat()) >= allocated_size(original):
             return False
         require_unshared_blocks(path)
         replace_unchanged_source(publication, original)
@@ -2443,12 +2452,17 @@ def run_compressor(paths, algo: str) -> set[Path]:
     # The tool does not write executable images in place; see is_mach_o. It
     # writes other files in place if no other process can write them.
     images = [path for path in paths if is_mach_o(path)]
-    busy = OPEN_FILES.busy([path for path in paths if path not in images])
+    busy = OPEN_FILES.busy([path for path in paths if path not in images],
+                           fresh=True)
     failures.update((path, FileInUseError(path, users))
                     for path, users in busy.items())
     in_place = [path for path in paths
                 if path not in images and path not in busy]
     diagnostics = []
+    sizes = {}
+    for path in in_place:
+        with contextlib.suppress(OSError):
+            sizes[path] = path.stat(follow_symlinks=False).st_size
     if in_place:
         command = (afsctool_compress_command(in_place, algo)
                    if TOOL == "afsctool"
@@ -2458,6 +2472,26 @@ def run_compressor(paths, algo: str) -> set[Path]:
         logger.debug("Compression stdout:\n%s", process.stdout)
         logger.debug("Compression stderr:\n%s", process.stderr)
         diagnostics = process.stderr.splitlines()
+        # A writer that opened a file after the snapshot can lose its data to
+        # the rewrite in place. That cannot be undone here, so it is reported.
+        late = OPEN_FILES.busy(in_place, fresh=True)
+        for path in in_place:
+            resized = False
+            if path in sizes:
+                try:
+                    resized = (path.stat(follow_symlinks=False).st_size
+                               != sizes[path])
+                except OSError:
+                    resized = True
+            if path in late:
+                logger.warning("%s was opened for writing during compression "
+                               "in place; check its contents", path)
+                failures[path] = FileInUseError(path, late[path])
+            elif resized:
+                failures[path] = RuntimeError(
+                    "size changed during compression in place; check the file"
+                )
+        in_place = [path for path in in_place if path not in failures]
     if TOOL != "afsctool":
         failures.update(dict.fromkeys(
             images, f"executable images require afsctool, not {TOOL}"
@@ -2538,7 +2572,6 @@ class Stats:
     skipped_cached: int = 0
     skipped_ratio: int = 0
     skipped_already: int = 0
-    skipped_shared: int = 0
     skipped_too_new: int = 0
     skipped_too_small: int = 0
     skipped_excluded_ext: int = 0
@@ -3028,7 +3061,9 @@ def scanner(args, roots: list[Path], q: queue.Queue[QueueItem], stats: Stats,
                     stats.skipped_hardlink += 1
                 continue
             is_compressed = already_compressed(fp)
-            if (not args.include_sparse and not is_compressed and
+            # Reading a dataless (iCloud, File Provider) file downloads it.
+            if (getattr(st, "st_flags", 0) & SF_DATALESS or
+                    not args.include_sparse and not is_compressed and
                     allocated_size(st) < st.st_size):
                 with lock:
                     stats.skipped_sparse += 1
@@ -3231,10 +3266,6 @@ class FileTask:
                 self.skip("skipped_recompress_unknown",
                           "recompress_codec_unknown")
                 return True
-        if (TOOL == "ditto" and not self.was_compressed
-                and native().sharing(self.path).private == 0):
-            self.skip("skipped_shared", "all_blocks_shared")
-            return True
         return False
 
     def check_sharing(self) -> bool:
@@ -4043,7 +4074,6 @@ def compression_summary(args: argparse.Namespace, stats: Stats,
         skipped_cached=stats.skipped_cached,
         skipped_ratio=stats.skipped_ratio,
         skipped_already=stats.skipped_already,
-        skipped_shared=stats.skipped_shared,
         skipped_too_new=stats.skipped_too_new,
         skipped_too_small=stats.skipped_too_small,
         skipped_excluded_ext=stats.skipped_excluded_ext,
@@ -4240,6 +4270,12 @@ def os_error(exc: OSError, error: str, exit_code: int,
 
 def run() -> int:
     """Run main() and convert uncaught failures to the CLI error contract."""
+    def interrupt(_signal, _frame):
+        raise KeyboardInterrupt
+    # Files in progress finish and clear their stages, as with an interrupt.
+    for number in (signal.SIGTERM, signal.SIGHUP):
+        if signal.getsignal(number) is signal.SIG_DFL:
+            signal.signal(number, interrupt)
     try:
         return main()
     except BrokenPipeError:

@@ -498,6 +498,15 @@ def signature(s):
             s.st_mode, s.st_uid, s.st_gid, s.st_flags, s.st_nlink]
 
 
+def on_device(recorded, device):
+    """A recorded signature or [device, inode] identity with the current device number.
+
+    Device numbers follow attach order and change across remounts and reboots.
+    Use this only after the volume UUID has been matched.
+    """
+    return [device, *recorded[1:]] if recorded else recorded
+
+
 def unchanged(current, recorded):
     """Compare signatures except ctime, which every rename updates."""
     return current[:4] == recorded[:4] and current[5:] == recorded[5:]
@@ -613,9 +622,13 @@ def private_stage_directory(native, directory, identity, missing_ok=False):
 def make_private_stage(native, directory):
     """Create an empty private stage, removing any inherited ACL before use."""
     directory.mkdir(mode=0o700)
-    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        st = os.fstat(fd)
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        remove_orphan_stage(directory)
+        raise
+    st = os.fstat(fd)
+    try:
         identity = [st.st_dev, st.st_ino]
         anchor = Path('/.vol') / str(st.st_dev) / str(st.st_ino)
         if st.st_uid != os.geteuid():
@@ -627,8 +640,34 @@ def make_private_stage(native, directory):
         private_stage_directory(native, directory, identity)
         sync_dir(directory.parent)
         return identity
+    except BaseException:
+        if (st.st_dev, st.st_ino) == _identity(lstat_or_none(directory)):
+            remove_orphan_stage(directory)
+        raise
     finally:
         os.close(fd)
+
+
+def _identity(status):
+    return (status.st_dev, status.st_ino) if status is not None else None
+
+
+def remove_orphan_stage(directory):
+    """Remove an empty stage directory of this user; True if it is gone.
+
+    A crash between mkdir and the journal record leaves one. rmdir refuses a
+    directory with entries, so a stage in use or awaiting recovery is kept.
+    """
+    status = lstat_or_none(directory)
+    if status is None:
+        return True
+    if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.geteuid():
+        return False
+    try:
+        os.rmdir(directory)
+    except OSError:
+        return False
+    return True
 
 
 def tracked_staging_path(native, root, destination, record, prefix):

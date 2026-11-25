@@ -548,11 +548,6 @@ app.ditto_compress_file(Path(sys.argv[1]))
             state = Path(directory, "state.sqlite")
             alias = path.with_name("COLD")
             target = alias if alias.exists() else path
-            retry = subprocess.run([sys.executable, "-B", str(script), "file", "compress",
-                                    str(target), "--backend", "ditto", "--state-db", str(state),
-                                    "--json"], capture_output=True, text=True)
-            self.assertEqual(retry.returncode, app.EXIT_CONFLICT, retry.stderr)
-            self.assertEqual(json.loads(retry.stdout)["error"], "publication_pending")
             args = [sys.executable, "-B", str(script), "file", "repair", str(target),
                     "--only", "interrupted_swap", "--state-db", str(state), "--json"]
             preview = subprocess.run([*args, "--dry-run"], check=True, capture_output=True, text=True)
@@ -563,6 +558,107 @@ app.ditto_compress_file(Path(sys.argv[1]))
             self.assertEqual(path.read_bytes(), data)
             self.assertEqual(app.native().metadata(path), metadata)
             self.assertFalse(stage.exists())
+
+    def interrupted_before_exchange(self, directory):
+        """A stage with a prepared journal and the staged copy; the path is untouched."""
+        import apfs_publish
+        path = Path(directory, "cold")
+        path.write_bytes(b"interrupted before the exchange\n" * 90_000)
+        with mock.patch.object(app, "BASE", ["ditto", "--hfsCompression", "--noclone"]), \
+             mock.patch.object(apfs_publish.Publication, "exchange",
+                               side_effect=KeyboardInterrupt), \
+             self.assertRaises(KeyboardInterrupt):
+            app.ditto_compress_file(path)
+        stage = app.publication_directory(path)
+        self.assertTrue((stage / "payload").exists())
+        return path, stage
+
+    def test_compress_settles_an_interrupted_publication_before_running(self):
+        script = Path(app.__file__)
+        with tempfile.TemporaryDirectory() as directory:
+            path, stage = self.interrupted_before_exchange(directory)
+            data, inode = path.read_bytes(), path.stat().st_ino
+            run = subprocess.run(
+                [sys.executable, "-B", str(script), "file", "compress", str(path),
+                 "--backend", "ditto", "--cutoff-days", "0", "--min-size", "1",
+                 "--ratio", "1", "--state-db", str(Path(directory, "state.sqlite")),
+                 "--json"], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            self.assertEqual(json.loads(run.stdout)["files_compressed"], 1)
+            self.assertFalse(stage.exists())
+            self.assertEqual(path.read_bytes(), data)
+            self.assertNotEqual(path.stat().st_ino, inode)
+            self.assertTrue(app.already_compressed(path))
+
+    def test_recovery_clears_interrupted_journal_writes(self):
+        import apfs_common
+        import apfs_publish
+        leftover = "publication.json." + "0" * 32 + ".tmp"
+        with tempfile.TemporaryDirectory() as directory:
+            # Death during the first journal write: only the temporary exists.
+            path = Path(directory, "first")
+            path.write_bytes(b"data")
+            stage = app.publication_directory(path)
+            apfs_common.make_private_stage(app.native(), stage)
+            (stage / leftover).write_text("{")
+            self.assertEqual(app.recover_publication(app.native(), stage, True), stage)
+            self.assertTrue((stage / leftover).exists())
+            app.recover_publication(app.native(), stage)
+            self.assertFalse(stage.exists())
+            # Death during the second: journal, staged copy and a temporary.
+            path, stage = self.interrupted_before_exchange(directory)
+            record = json.loads((stage / apfs_publish.JOURNAL).read_text())
+            del record["original"], record["replacement"]
+            (stage / apfs_publish.JOURNAL).write_text(json.dumps(record))
+            (stage / leftover).write_text("{")
+            data, inode = path.read_bytes(), path.stat().st_ino
+            self.assertEqual(app.recover_publication(app.native(), stage), path)
+            self.assertFalse(stage.exists())
+            self.assertEqual((path.read_bytes(), path.stat().st_ino), (data, inode))
+
+    def test_recovery_follows_a_changed_device_number(self):
+        import apfs_publish
+        with tempfile.TemporaryDirectory() as directory:
+            path, stage = self.interrupted_before_exchange(directory)
+            journal = stage / apfs_publish.JOURNAL
+            record = json.loads(journal.read_text())
+            record["directory"][0] += 7
+            for side in ("original", "replacement"):
+                record[side]["signature"][0] += 7
+            journal.write_text(json.dumps({**record, "volume": "another-volume"}))
+            with self.assertRaisesRegex(app.PublicationConflict, "Invalid publication journal"):
+                app.recover_publication(app.native(), stage)
+            journal.write_text(json.dumps(record))
+            inode = path.stat().st_ino
+            self.assertEqual(app.recover_publication(app.native(), stage), path)
+            self.assertFalse(stage.exists())
+            self.assertEqual(path.stat().st_ino, inode)
+
+    def test_recovery_discards_the_staged_copy_after_the_path_was_replaced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, stage = self.interrupted_before_exchange(directory)
+            saved = path.with_name("saved")
+            saved.write_bytes(b"version saved by an editor")
+            os.replace(saved, path)
+            self.assertEqual(app.recover_publication(app.native(), stage), path)
+            self.assertFalse(stage.exists())
+            self.assertEqual(path.read_bytes(), b"version saved by an editor")
+
+    def test_in_place_compression_takes_a_fresh_open_file_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "text.txt")
+            path.write_bytes(b"text" * 1024)
+            app.OPEN_FILES.busy.reset_mock()
+            with mock.patch.object(app, "require_unshared_blocks"), \
+                 mock.patch.object(app, "TOOL", "afsctool"), \
+                 mock.patch.object(app, "BASE", ["afsctool", "-c", "-v"]), \
+                 mock.patch.object(app, "run_command",
+                                   return_value=SimpleNamespace(stdout="", stderr="")), \
+                 mock.patch.object(app, "already_compressed", return_value=True):
+                app.run_compressor(path, "lzfse")
+            # One snapshot directly before the write in place, one after it.
+            self.assertEqual(app.OPEN_FILES.busy.call_args_list,
+                             [mock.call([path], fresh=True)] * 2)
 
     def test_open_file_users_returns_process_and_access_metadata(self):
         use = app.OpenUse

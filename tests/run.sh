@@ -157,6 +157,10 @@ mkwt rm-dirty
 echo wip > "$WTS/rm-dirty/wip.txt"
 if rmwt "$WTS/rm-dirty"; then fail "remove hook removed a worktree with untracked work"; fi
 [ -f "$WTS/rm-dirty/wip.txt" ] || fail "refused removal still lost the file"
+git -C "$R" config status.showUntrackedFiles no
+if rmwt "$WTS/rm-dirty"; then fail "remove hook removed untracked work hidden by status.showUntrackedFiles"; fi
+git -C "$R" config --unset status.showUntrackedFiles
+[ -f "$WTS/rm-dirty/wip.txt" ] || fail "hidden untracked file was lost"
 echo edit >> "$WTS/rm-dirty/src/f2"; rm "$WTS/rm-dirty/wip.txt"
 if rmwt "$WTS/rm-dirty"; then fail "remove hook removed a worktree with modified files"; fi
 git -C "$WTS/rm-dirty" checkout -q --detach; git -C "$WTS/rm-dirty" checkout -q -- src/f2

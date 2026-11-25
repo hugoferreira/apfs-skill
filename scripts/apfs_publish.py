@@ -5,14 +5,17 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 
 from apfs_common import (STAGE_PAYLOAD, Conflict, atomic_write, file_checkpoint,
-                         lstat_or_none, make_private_stage, matches_checkpoint,
+                         lstat_or_none, make_private_stage, matches_checkpoint, on_device,
                          private_stage_directory, remove_private_stage, signature, sync_dir, sync_file)
 
 PUBLICATION_PREFIX = '.apfs-compress-plus-swap-'
 JOURNAL = 'publication.json'
+# atomic_write leaves this beside the journal if the process dies during a write.
+JOURNAL_TEMPORARY = re.compile(re.escape(JOURNAL) + r'\.[0-9a-f]{32}\.tmp')
 F_GETPATH = 50  # Darwin <sys/fcntl.h>
 
 
@@ -56,6 +59,33 @@ def locked_stage(native, directory, identity):
         os.close(fd)
 
 
+def volume_uuid(native, path):
+    """UUID of the APFS volume holding path, or None where it cannot be read."""
+    try:
+        return native.volume_identity(path)['uuid']
+    except (OSError, ValueError):
+        return None
+
+
+def journal_temporaries(anchor):
+    """Interrupted journal writes in a stage; they never authorized an exchange."""
+    found = []
+    for entry in anchor.iterdir():
+        if JOURNAL_TEMPORARY.fullmatch(entry.name):
+            status = entry.lstat()
+            if stat.S_ISREG(status.st_mode) and status.st_uid == os.geteuid() and status.st_nlink == 1:
+                found.append(entry)
+    return found
+
+
+def clear_journal_temporaries(anchor):
+    removed = journal_temporaries(anchor)
+    for entry in removed:
+        entry.unlink(missing_ok=True)
+    if removed:
+        sync_dir(anchor)
+
+
 class Publication:
     def __init__(self, native, path, directory, identity, anchor):
         self.native = native
@@ -74,6 +104,7 @@ class Publication:
         sync_dir(self.payload.parent)
         self.journal.unlink(missing_ok=True)
         sync_dir(self.journal.parent)
+        clear_journal_temporaries(self.journal.parent)
         remove_private_stage(self.native, self.directory / STAGE_PAYLOAD, self.identity)
 
     def in_use(self, expected):
@@ -97,9 +128,7 @@ class Publication:
             return
         original, replacement = self.record['original'], self.record['replacement']
         dst = lstat_or_none(self.path)
-        if dst is None:
-            raise self.conflict()
-        if signature(dst)[:2] == replacement['signature'][:2]:
+        if dst is not None and signature(dst)[:2] == replacement['signature'][:2]:
             candidate = self.payload.lstat()
             if (signature(candidate)[:2] != original['signature'][:2]
                     or not matches_checkpoint(self.native, self.path, replacement)
@@ -108,8 +137,12 @@ class Publication:
             if dry_run:
                 return
             self.exchange()
-        restored = lstat_or_none(self.path)
-        if (restored is None or signature(restored)[:2] != original['signature'][:2]
+        # The stage must now hold the unmodified staged copy, which is
+        # disposable whatever the path names: the original, a version saved
+        # later under a new inode, or nothing. Anything else in the stage may
+        # be the only copy of the original, so both are kept.
+        staged = lstat_or_none(self.payload)
+        if (staged is None or signature(staged)[:2] != replacement['signature'][:2]
                 or not matches_checkpoint(self.native, self.payload, replacement)
                 or self.in_use(replacement)):
             raise self.conflict()
@@ -159,6 +192,7 @@ def staged_replacement(native, path):
         ) from error
     with locked_stage(native, directory, identity) as anchor:
         publication = Publication(native, path, directory, identity, anchor)
+        publication.record['volume'] = volume_uuid(native, anchor)
         try:
             publication.save()
             yield publication
@@ -175,9 +209,13 @@ def recover_publication(native, directory, dry_run=False):
     identity = [st.st_dev, st.st_ino]
     with locked_stage(native, directory, identity) as anchor:
         marker = anchor / JOURNAL
+        interrupted = set(journal_temporaries(anchor))
+        if not dry_run:
+            clear_journal_temporaries(anchor)
         if lstat_or_none(marker) is None:
-            # A crash can occur just after mkdir. Unknown contents require review.
-            if any(anchor.iterdir()):
+            # A crash can occur just after mkdir or during the first journal
+            # write. Unknown contents require review.
+            if any(entry not in interrupted for entry in anchor.iterdir()):
                 raise PublicationConflict(f'Staging files have no recovery journal: {directory}')
             if not dry_run:
                 remove_private_stage(native, directory / STAGE_PAYLOAD, identity)
@@ -188,6 +226,15 @@ def recover_publication(native, directory, dry_run=False):
             if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_nlink != 1:
                 raise PublicationConflict(f'Unsafe publication journal: {directory}')
             record = json.load(stream)
+        recorded = record['directory']
+        if (recorded != identity and isinstance(recorded, list) and len(recorded) == 2
+                and recorded[1] == identity[1] and record.get('volume')
+                and record['volume'] == volume_uuid(native, anchor)):
+            # Same volume and inode: the device number changed with a remount.
+            record['directory'] = identity
+            for side in ('original', 'replacement'):
+                if side in record:
+                    record[side]['signature'] = on_device(record[side]['signature'], identity[0])
         name = record['name']
         path = directory.parent / name
         if (record['version'] != 1 or record['directory'] != identity

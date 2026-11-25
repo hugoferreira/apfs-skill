@@ -710,4 +710,53 @@ class Tests(unittest.TestCase):
             'reason': 'Compressed file has unverified hidden xattrs (com.apple.ResourceFork)',
         }])
 
+    def test_renamed_root_keeps_its_journal(self):
+        self.pair()
+        self.assertEqual(self.run_cli('--apply')['cloned_files'], 1)
+        moved = self.root.with_name('moved')
+        self.root.rename(moved)
+        # The state directory is bound to the root path; the journal is not.
+        self.root, self.state = moved, moved.parent / 'moved-state'
+        result = self.run_cli('--apply')
+        self.assertEqual((result['cloned_files'], result['already_completed_files']), (0, 1))
+        copy = moved.with_name('copy')
+        subprocess.run(['/bin/cp', '-R', str(moved), str(copy)], check=True)
+        self.root, self.state = copy, moved.parent / 'copy-state'
+        self.assertIn('another root', self.run_cli(code=1)['message'])
+
+    def test_apply_removes_an_orphan_stage_directory(self):
+        self.pair()
+        orphan = self.root / (d.PREFIX + '0' * 32)
+        orphan.mkdir(mode=0o700)
+        kept = self.root / (d.PREFIX + '1' * 32)
+        kept.mkdir(mode=0o700)
+        (kept / 'payload').write_bytes(b'unjournaled')
+        self.run_cli()
+        self.assertTrue(orphan.exists())
+        self.assertEqual(self.run_cli('--apply')['cloned_files'], 1)
+        self.assertFalse(orphan.exists())
+        self.assertEqual((kept / 'payload').read_bytes(), b'unjournaled')
+
+    def test_recovery_follows_a_changed_device_number(self):
+        a, b, item = self.exchanged()
+        journal = self.root / '.apfs-dedupe.jsonl.gz'
+        records = [json.loads(line) for line in gzip.decompress(journal.read_bytes()).splitlines()]
+        self.assertIn('volume', records[0])
+        for record in records:
+            for key in ('staging_directory', 'original', 'signature'):
+                if record['event'] in ('stage', 'prepared') and key in record:
+                    record[key][0] += 7
+        journal.write_bytes(b''.join(gzip.compress((json.dumps(record, sort_keys=True) + '\n').encode(), mtime=0)
+                                     for record in records))
+        self.assertEqual(self.run_cli('--apply')['cloned_files'], 1)
+        self.assertFalse(list(self.root.glob(d.PREFIX + '*')))
+        self.assertEqual(a.read_bytes(), b.read_bytes())
+
+    def test_dataless_files_are_not_eligible(self):
+        a, _ = self.pair()
+        s = a.stat()
+        fields = dict(st_mode=s.st_mode, st_nlink=1, st_size=s.st_size, st_uid=s.st_uid)
+        self.assertTrue(d.eligible(d.SimpleNamespace(**fields, st_flags=0)))
+        self.assertFalse(d.eligible(d.SimpleNamespace(**fields, st_flags=d.SF_DATALESS)))
+
 if __name__=='__main__':unittest.main(verbosity=2)
