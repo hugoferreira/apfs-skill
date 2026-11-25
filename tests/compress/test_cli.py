@@ -563,6 +563,44 @@ class CLIContractTests(unittest.TestCase):
         self.assertEqual(records[0]["record_type"], "file")
         self.assertEqual(records[-1]["record_type"], "summary")
 
+    def test_scan_and_saved_plan_skip_shared_apfs_blocks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.txt"
+            clone = root / "clone.txt"
+            plan = root / "plan.json"
+            state = root / "state.sqlite"
+            content = b"compressible text\n" * 65536
+            source.write_bytes(content)
+            options = ("--cutoff-days", "0", "--min-size", "1",
+                       "--ratio", "1", "--state-db", state, "--json")
+
+            before = run_cli("file", "scan", source, "--plan", plan, *options)
+            self.assertEqual(before.returncode, 0, before.stderr)
+            self.assertEqual(json.loads(before.stdout)["files_suggested"], 1)
+            subprocess.run(["/bin/cp", "-c", source, clone], check=True)
+            def check_scan():
+                scan = run_cli("file", "scan", source, clone, *options)
+                self.assertEqual(scan.returncode, 0, scan.stderr)
+                result = json.loads(scan.stdout)
+                self.assertEqual(result["skipped_shared_blocks"], 2)
+                self.assertEqual(result["estimated_bytes_saved"], 0)
+
+            check_scan()
+            applied = run_cli(
+                "file", "compress", "--from-plan", plan,
+                "--backend", "ditto", "--state-db", state, "--json",
+            )
+            self.assertEqual(applied.returncode, 0, applied.stderr)
+            result = json.loads(applied.stdout)
+            self.assertEqual(result["skipped_shared_blocks"], 1)
+            self.assertEqual(result["files_compressed"], 0)
+            self.assertEqual(source.read_bytes(), content)
+            self.assertEqual(clone.read_bytes(), content)
+            with clone.open("r+b") as stream:
+                stream.write(b"X")
+            check_scan()
+
     def test_scan_plan_can_be_applied_without_resampling(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

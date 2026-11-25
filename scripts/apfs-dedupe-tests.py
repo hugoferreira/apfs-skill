@@ -559,14 +559,64 @@ class Tests(unittest.TestCase):
             r=self.cli_text(*args,code=2)
             self.assertEqual(r.stdout,'')
             self.assertIn('--top',r.stderr)
+    def make_compressed_copy(self,path,content):
+        path.write_bytes(b'')
+        value=struct.pack('<IIQ',0x636d7066,3,len(content))+zlib.compress(content)
+        self.native.set_xattr(path,b'com.apple.decmpfs',value)
+        os.chflags(path,d.COMPRESSED)
+        self.assertEqual(path.read_bytes(),content)
+
+    def test_compressed_clone_preserves_original_canonical_keeper(self):
+        a,b=self.pair()
+        c=self.root/'c'
+        content=a.read_bytes()
+        c.write_bytes(content)
+        self.assertEqual(self.run_cli('--apply')['cloned_files'],2)
+        journal=self.root/'.apfs-dedupe.jsonl.gz'
+        # Older tools recorded the physical source without a canonical field.
+        with gzip.open(journal,'rt') as stream:
+            records=[json.loads(line) for line in stream]
+        with gzip.open(journal,'wt') as stream:
+            for record in records:
+                record.pop('canonical_keeper',None)
+                stream.write(json.dumps(record)+'\n')
+
+        self.make_compressed_copy(b,content)
+        donor_inode=b.stat().st_ino
+        preview=self.run_cli('--top','1')
+        self.assertEqual(preview['top_groups'][0]['canonical_keeper'],'a')
+        self.assertEqual({(x['source'],x['destination'],x['canonical_keeper'])
+                          for x in preview['changes']},
+                         {('b','a','a'),('b','c','a')})
+        self.assertEqual(self.run_cli('--apply')['cloned_files'],2)
+        self.assertEqual(b.stat().st_ino,donor_inode)
+        self.assertTrue(all(path.stat().st_flags & d.COMPRESSED for path in (a,b,c)))
+        self.assertEqual(len({self.native.sharing(path).clone_id for path in (a,b,c)}),1)
+        self.assertEqual(self.run_cli()['planned_files'],0)
+        inspector=SCRIPT.with_name('apfs-inspect.py')
+        report=json.loads(subprocess.check_output(
+            [sys.executable,str(inspector),'--tree',str(self.root),'--json']))
+        self.assertEqual(report['clone_shared_files'],3)
+
+        (self.root/'new').write_bytes(content)
+        # Rebuild the index from the journal alone, as on another invocation with
+        # an empty state directory. Future duplicates are cloned directly from a.
+        fresh_state=self.root.parent/'fresh-state'
+        changes=self.run_cli('--state-dir',str(fresh_state))['changes']
+        self.assertEqual([(x['source'],x['destination'],x['canonical_keeper'])
+                          for x in changes],[('a','new','a')])
+
+        # A path reused for unrelated content is no longer a valid keeper.
+        a.unlink()
+        a.write_bytes(b'X'*len(content))
+        changes=self.run_cli()['changes']
+        self.assertEqual([(x['source'],x['destination'],x['canonical_keeper'])
+                          for x in changes],[('b','new','b')])
+
     def test_compressed_copy_is_kept(self):
-        a=self.root/'a';a.write_bytes(b'compressible line of text\n'*80000)
+        a=self.root/'a';a.write_bytes(b'compressible line of text\n'*2048)
         b=self.root/'b'
-        subprocess.run(['/usr/bin/ditto','--noclone','--hfsCompression',str(a),str(b)],check=True)
-        if not b.stat().st_flags & d.COMPRESSED:
-            self.assertEqual(self.native.decmpfs(b)[1],a.stat().st_size)
-            os.chflags(b,b.stat().st_flags | d.COMPRESSED)
-        self.assertTrue(b.stat().st_flags & d.COMPRESSED,'ditto did not compress fixture')
+        self.make_compressed_copy(b,a.read_bytes())
         self.assertLess(b.stat().st_blocks,a.stat().st_blocks)
         preview=self.run_cli('--top','1')
         self.assertEqual([(c['source'],c['destination']) for c in preview['changes']],[('b','a')])
@@ -603,9 +653,9 @@ class Tests(unittest.TestCase):
         self.assertEqual([(x['source'],x['destination'],x['estimated_physical_bytes']) for x in result['changes']],
                          [('b','a',a.stat().st_blocks*512)])
         self.assertEqual(result['already_shared_files'],1)
-        c_inode=c.stat().st_ino
+        inode=c.stat().st_ino
         self.assertEqual(self.run_cli('--apply')['cloned_files'],1)
-        self.assertEqual(c.stat().st_ino,c_inode)
+        self.assertEqual(c.stat().st_ino,inode)
         self.assertEqual(self.native.sharing(a)[1],self.native.sharing(b)[1])
     def test_smaller_keeper_can_replace_a_previously_completed_clone(self):
         content=b'repeatable content for APFS compression\n'*50_000

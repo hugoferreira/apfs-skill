@@ -125,6 +125,8 @@ def tree_report(root):
         if r['compressed']:
             t['compressed_files'] += 1
             t['compressed_allocated'] += r['allocated']
+            if (r['refcnt'] or 0) > 1 or 'shares_all_blocks' in r['flags']:
+                t['clone_shared_files'] += 1
             # No private size for compressed files: count full allocation once per clone id.
             cid = r['clone_id'] or ('inode', key)
             family_shared[cid] = max(family_shared.get(cid, 0), r['allocated'])

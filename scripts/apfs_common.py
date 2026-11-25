@@ -319,7 +319,7 @@ class Native:
         buf = C.create_string_buffer(64)
         if self.lib.getattrlist(os.fsencode(path), C.byref(attr), buf, 64,
                                 FSOPT_ATTR_CMN_EXTENDED | FSOPT_NOFOLLOW) < 0:
-            if C.get_errno() == errno.EINVAL:   # filesystem without extended attributes
+            if C.get_errno() in (errno.EINVAL, errno.ENOTSUP):
                 return Sharing(None, None, None, None)
             raise _fail(path)
         returned = int.from_bytes(buf.raw[20:24], sys.byteorder)

@@ -54,7 +54,8 @@ if sys.version_info < MIN_PYTHON:
     print("Suggestion: rerun with a newer python3", file=sys.stderr)
     sys.exit(EXIT_UNSUPPORTED)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from apfs_common import (DECMPFS_XATTR, PROVENANCE_XATTR, STAGING_PREFIXES, UNSAFE_FLAGS, Conflict,  # noqa: E402
+from apfs_common import (DECMPFS_XATTR, EF_MAY_SHARE_BLOCKS, EF_SHARES_ALL_BLOCKS,  # noqa: E402
+                         PROVENANCE_XATTR, STAGING_PREFIXES, UNSAFE_FLAGS, Conflict,
                          XATTR_NOFOLLOW, Native, OpenUse, atomic_write,
                          free_bytes, human_bytes, signature)
 from apfs_publish import (PUBLICATION_PREFIX, PublicationConflict, publication_directory,
@@ -117,6 +118,10 @@ class FileInUseError(RuntimeError):
         super().__init__(f"file is open by {names}")
 
 
+class SharedBlocksError(RuntimeError):
+    """Compression would split APFS block sharing."""
+
+
 class NoSavingsError(RuntimeError):
     """The compressor ran without an error and found no saving."""
 
@@ -135,8 +140,8 @@ class CompressorRefusedError(RuntimeError):
 
     def error_for_path(self, path: Path) -> Exception:
         cause = self.causes.get(str(path))
-        if isinstance(cause, (FileInUseError, NoSavingsError, PublicationConflict, OSError,
-                              subprocess.CalledProcessError)):
+        if isinstance(cause, (FileInUseError, NoSavingsError, SharedBlocksError,
+                              PublicationConflict, OSError, subprocess.CalledProcessError)):
             return cause
         message = self.failures.get(str(path), "compressor refused the file")
         return CompressorRefusedError({path: message})
@@ -234,7 +239,7 @@ def write_compression_summary(result: dict) -> None:
     print("Compression scan complete" if dry_run else "Compression complete")
     skipped = (result["skipped_cached"] + result["skipped_ratio"] +
                result["skipped_already"] + result["skipped_budget"] +
-               result["skipped_in_use"])
+               result["skipped_in_use"] + result["skipped_shared_blocks"])
     fields = [
         ("Scanned", result["files_scanned"]),
         ("Eligible", result["files_queued"]),
@@ -258,6 +263,7 @@ def write_compression_summary(result: dict) -> None:
     for label, key in (("No savings", "processed_no_savings"),
                        ("Safe fallback", "files_atomic_fallback"),
                        ("In use", "skipped_in_use"),
+                       ("Shared APFS blocks", "skipped_shared_blocks"),
                        ("Excluded", "skipped_excluded"),
                        ("Owned by others", "skipped_not_owned"),
                        ("Unsafe metadata", "skipped_blocked")):
@@ -1645,6 +1651,7 @@ def recompress_file(path: Path, new_algorithm: str,
 
     Return True if a copy replaced the file.
     """
+    require_unshared_blocks(path)
     if TOOL != "afsctool":
         raise RuntimeError("safe recompression requires afsctool")
     if is_mach_o(path):
@@ -2362,6 +2369,7 @@ def atomic_compress_file(path: Path, algo: str) -> None:
             raise declined(Path(temporary.name), process.stderr.splitlines())
         if allocated_size(temporary.stat()) >= allocated_size(original):
             raise NoSavingsError("compression saved no allocated bytes")
+        require_unshared_blocks(path)
         replace_unchanged_source(publication, original)
 
 
@@ -2395,6 +2403,7 @@ def ditto_compress_file(path: Path) -> bool:
             reclaimable = min(reclaimable, private)
         if allocated_size(temporary.stat()) >= reclaimable:
             return False
+        require_unshared_blocks(path)
         replace_unchanged_source(publication, original)
         return True
 
@@ -2408,6 +2417,11 @@ def run_compressor(paths, algo: str) -> set[Path]:
         paths = [paths]
     failures: dict[Path, BaseException | str] = {}
     for path in paths:
+        try:
+            require_unshared_blocks(path)
+        except (OSError, SharedBlocksError) as exc:
+            failures[path] = exc
+            continue
         blockers = compression_blockers(path)
         if blockers:
             failures[path] = RuntimeError(
@@ -2487,6 +2501,23 @@ def allocated_size(st: os.stat_result) -> int:
     return blocks * 512 if blocks is not None else st.st_size
 
 
+def shares_apfs_blocks(path: Path, st: os.stat_result) -> bool:
+    """Detect exact clones and files whose extents are only partly private."""
+    sharing = native().sharing(path)
+    private, flags, refcount = sharing.private, sharing.ext_flags or 0, sharing.refcnt or 0
+    if flags & EF_SHARES_ALL_BLOCKS or refcount > 1:
+        return True
+    # APFS reports zero private bytes for even an unshared compressed stream.
+    compressed = getattr(st, "st_flags", 0) & getattr(stat, "UF_COMPRESSED", 0)
+    return (not compressed and bool(flags & EF_MAY_SHARE_BLOCKS)
+            and private is not None and private < allocated_size(st))
+
+
+def require_unshared_blocks(path: Path) -> None:
+    if shares_apfs_blocks(path, path.stat(follow_symlinks=False)):
+        raise SharedBlocksError("APFS data blocks are shared with another file")
+
+
 def estimated_allocated_size(logical_size: int, current_allocated: int,
                             ratio: float) -> int:
     """Estimate the physical size, rounded to an APFS allocation block."""
@@ -2513,6 +2544,7 @@ class Stats:
     skipped_excluded_ext: int = 0
     skipped_hardlink: int = 0
     skipped_sparse: int = 0
+    skipped_shared_blocks: int = 0
     skipped_changed: int = 0
     skipped_in_use: int = 0
     skipped_budget: int = 0
@@ -3205,6 +3237,12 @@ class FileTask:
             return True
         return False
 
+    def check_sharing(self) -> bool:
+        if not shares_apfs_blocks(self.path, self.st):
+            return False
+        self.skip("skipped_shared_blocks", "shared_apfs_blocks")
+        return True
+
     def check_budget(self) -> bool:
         """Settle a file that arrives after the budget ended."""
         if (self.context.budget.exhausted() and
@@ -3452,8 +3490,8 @@ class FileTask:
 
     # ── control ──────────────────────────────────────────────────────────────
     def process(self) -> None:
-        for step in (self.check_identity, self.check_cache, self.classify,
-                     self.check_budget, self.select, self.reject,
+        for step in (self.check_identity, self.check_cache, self.check_sharing,
+                     self.classify, self.check_budget, self.select, self.reject,
                      self.suggest, self.reserve):
             if step():
                 return
@@ -3472,6 +3510,9 @@ class FileTask:
         except RunStopped:
             self.release_budget()
             return False
+        except SharedBlocksError:
+            self.release_budget()
+            self.skip("skipped_shared_blocks", "shared_apfs_blocks")
         except NoSavingsError:
             self.release_budget()
             with self.context.lock:
@@ -4017,6 +4058,7 @@ def compression_summary(args: argparse.Namespace, stats: Stats,
         skipped_budget=stats.skipped_budget,
         processed_no_savings=stats.processed_no_savings,
         files_recompressed=stats.recompressed,
+        skipped_shared_blocks=stats.skipped_shared_blocks,
         skipped_recompress_gain=stats.skipped_recompress_gain,
         skipped_recompress_unknown=stats.skipped_recompress_unknown,
         recompressions_reverted=stats.reverted_recompress,

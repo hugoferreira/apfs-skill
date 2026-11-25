@@ -91,7 +91,9 @@ Tools:
 - `afsctool` (`brew install afsctool`): `-c` compress, `-d` decompress, `-v` show method and ratio, `-T LZFSE|LZVN|ZLIB`, `-j N` parallel.
 - `applesauce` (Rust): compress/decompress/info, refuses to grow files.
 
-Cloning a compressed file shares the compressed blocks and keeps the compression flag. Compress before deduplication so the group can share those blocks. Compressing just one member of an existing clone family can increase usage because other members keep the old blocks. The staged `ditto` backend only publishes a compressed copy if it uses less space than the source's private allocation.
+Cloning a compressed file shares the compressed blocks and keeps the compression flag. Compression scans and apply runs skip files with shared APFS blocks, because compressing one member of a clone family allocates a new compressed stream while the other members keep the old blocks. A saved plan rechecks sharing when applied. Structured output counts these files under `skipped_shared_blocks`.
+
+To combine both techniques for exact duplicates, compress before deduplication, as `apfs-reclaim.py` does, or compress one independent copy and let dedupe choose it as the keeper if it uses less space. Clones of a compressed keeper share the compressed blocks. Old extents are freed when their last reference is gone, including references outside the scanned tree. The staged `ditto` backend only publishes a compressed copy if it uses less space than the source's private allocation.
 
 ## Sources
 

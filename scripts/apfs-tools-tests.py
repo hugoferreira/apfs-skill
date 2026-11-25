@@ -295,6 +295,36 @@ finally:
         self.assertEqual((self.dest / 'b').read_bytes(), content)
         self.assertEqual(t.metadata(self.native, a), t.metadata(self.native, self.dest / 'a'))
 
+    def test_compressed_transfer(self):
+        import struct, zlib
+        self.pair()
+        a = self.source / 'a'
+        content = a.read_bytes()
+        a.write_bytes(b'')
+        value = struct.pack('<IIQ', 0x636d7066, 3, len(content)) + zlib.compress(content)
+        self.native.set_xattr(a,'com.apple.decmpfs',value)
+        os.chflags(a, c.UF_COMPRESSED)
+        self.cli('--apply')
+        self.assertEqual((self.dest / 'a').read_bytes(), content)
+        self.assertEqual((self.dest / 'b').read_bytes(), content)
+        self.assertTrue((self.dest / 'a').stat().st_flags & c.UF_COMPRESSED)
+        self.assertEqual(t.metadata(self.native, a), t.metadata(self.native, self.dest / 'a'))
+
+    def test_transfer_keeps_compact_source_when_larger_duplicate_came_first(self):
+        import struct, zlib
+        self.pair()
+        a = self.source / 'b'
+        content = a.read_bytes()
+        a.write_bytes(b'')
+        value = struct.pack('<IIQ', 0x636d7066, 3, len(content)) + zlib.compress(content)
+        self.native.set_xattr(a,'com.apple.decmpfs',value)
+        os.chflags(a, c.UF_COMPRESSED)
+        self.cli('--apply')
+        self.assertEqual((self.dest / 'a').read_bytes(), content)
+        self.assertEqual((self.dest / 'b').read_bytes(), content)
+        self.assertTrue((self.dest / 'b').stat().st_flags & c.UF_COMPRESSED)
+        self.assertEqual(t.metadata(self.native, a), t.metadata(self.native, self.dest / 'b'))
+
     def test_transfer_interrupted_staging_recovers(self):
         self.pair()
         args = type('Args', (), dict(apply=True, quiet=True, exclude=[], exclude_system=False, replace=False, verify_all=False))()

@@ -127,6 +127,51 @@ OUT2="$(printf '{"name":"bold-oak","cwd":"%s"}' "$R" | $H 2>/dev/null)"
 if printf '{"name":"../escape","cwd":"%s"}' "$R" | $H >/dev/null 2>&1; then fail "hook accepted a traversal name"; fi
 ok "WorktreeCreate hook creates, reuses and validates"
 
+mkwt() { printf '{"hook_event_name":"WorktreeCreate","name":"%s","cwd":"%s"}' "$1" "$R" | $H >/dev/null 2>&1; }
+rmwt() { p="$1"; shift; printf '{"hook_event_name":"WorktreeRemove","worktree_path":"%s"}' "$p" | $H "$@" 2>"$T/rm.err"; }
+has_branch() { [ -n "$(git -C "$R" branch --list "$1")" ]; }
+WTS="$R/.claude/worktrees"
+
+mkwt rm-unused
+rmwt "$WTS/rm-unused" || fail "remove hook failed on an unused worktree: $(cat "$T/rm.err")"
+[ ! -e "$WTS/rm-unused" ] || fail "remove hook left the worktree directory"
+has_branch worktree-rm-unused && fail "remove hook kept a branch without commits of its own"
+git -C "$R" worktree list | grep -q rm-unused && fail "removed worktree still registered"
+
+mkwt rm-unmerged
+echo work > "$WTS/rm-unmerged/work.txt"; git -C "$WTS/rm-unmerged" add work.txt; git -C "$WTS/rm-unmerged" commit -qm work
+rmwt "$WTS/rm-unmerged" || fail "remove hook failed on a committed worktree"
+[ ! -e "$WTS/rm-unmerged" ] || fail "remove hook left a clean committed worktree"
+has_branch worktree-rm-unmerged || fail "remove hook deleted a branch with unmerged commits"
+grep -q 'kept branch worktree-rm-unmerged: 1 commit' "$T/rm.err" || fail "unmerged branch not reported: $(cat "$T/rm.err")"
+
+mkwt rm-merged
+echo done > "$WTS/rm-merged/done.txt"; git -C "$WTS/rm-merged" add done.txt; git -C "$WTS/rm-merged" commit -qm done
+git -C "$R" branch integration worktree-rm-merged
+rmwt "$WTS/rm-merged" || fail "remove hook failed on a merged worktree"
+has_branch worktree-rm-merged && fail "remove hook kept a merged branch"
+git -C "$R" cat-file -e integration:done.txt || fail "merged work was lost"
+ok "WorktreeRemove hook removes worktrees and deletes only merged branches"
+
+mkwt rm-dirty
+echo wip > "$WTS/rm-dirty/wip.txt"
+if rmwt "$WTS/rm-dirty"; then fail "remove hook removed a worktree with untracked work"; fi
+[ -f "$WTS/rm-dirty/wip.txt" ] || fail "refused removal still lost the file"
+echo edit >> "$WTS/rm-dirty/src/f2"; rm "$WTS/rm-dirty/wip.txt"
+if rmwt "$WTS/rm-dirty"; then fail "remove hook removed a worktree with modified files"; fi
+git -C "$WTS/rm-dirty" checkout -q --detach; git -C "$WTS/rm-dirty" checkout -q -- src/f2
+echo orphan > "$WTS/rm-dirty/o.txt"; git -C "$WTS/rm-dirty" add o.txt; git -C "$WTS/rm-dirty" commit -qm orphan
+if rmwt "$WTS/rm-dirty"; then fail "remove hook dropped commits on a detached HEAD"; fi
+rmwt "$WTS/rm-dirty" --force || fail "--force did not remove the worktree"
+[ ! -e "$WTS/rm-dirty" ] || fail "--force left the worktree"
+has_branch worktree-rm-dirty && fail "original branch of a switched worktree was kept although unused"
+mkdir "$T/plain"; echo keep > "$T/plain/f"
+if rmwt "$T/plain"; then fail "remove hook accepted a plain directory"; fi
+if rmwt "$R"; then fail "remove hook accepted the main working tree"; fi
+[ -f "$T/plain/f" ] && [ -d "$R/.git" ] || fail "refused removal deleted something"
+rmwt "$T/never-existed" || fail "remove hook failed on a missing path"
+ok "WorktreeRemove hook refuses uncommitted work, unreachable commits and non-worktrees"
+
 # ---------------------------------------------------------------- checkpoint
 W="$T/wt"
 $CP create "$W" -m baseline >/dev/null

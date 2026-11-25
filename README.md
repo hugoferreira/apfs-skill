@@ -15,7 +15,7 @@ The scripts are standalone command-line tools.
 | Preview or run transparent compression and deduplication together | `apfs-reclaim.py` | |
 | Copy a tree to another volume, verified and resumable, sharing duplicates at the destination | `apfs-transfer.py` | |
 | Compress cold files transparently (LZVN/LZFSE/zlib) with a plan, a budget and a state database | `apfs_compress_plus.py` | |
-| Make Claude Code's own worktrees (`--worktree`, subagent isolation) copy-on-write | `claude-worktree-hook.py` | |
+| Make Claude Code's own worktrees (`--worktree`, subagent isolation) copy-on-write, and delete their branches once merged | `claude-worktree-hook.py` | |
 
 `SKILL.md` adds the rules an agent needs to apply these correctly: which copy commands clone and which silently write full copies, why deleting does not always free space, what breaks when a `.venv` or `.git` is cloned, and when snapshots, case-sensitive volumes, sparse images or RAM disks are the right tool.
 
@@ -88,7 +88,7 @@ Every script prints its manual with `--help`.
 
 ## Copy-on-write worktrees for Claude Code sessions
 
-Claude Code creates worktrees with `git worktree add`, which writes every tracked file and starts without dependencies or build output. A `WorktreeCreate` hook replaces that step. Add to `~/.claude/settings.json`:
+Claude Code creates worktrees with `git worktree add`, which writes every tracked file and starts without dependencies or build output. A `WorktreeCreate` hook replaces that step, and a `WorktreeRemove` hook cleans up afterwards. Add to `~/.claude/settings.json`:
 
 ```json
 {
@@ -96,12 +96,16 @@ Claude Code creates worktrees with `git worktree add`, which writes every tracke
     "WorktreeCreate": [
       { "hooks": [ { "type": "command",
           "command": "python3 ~/.claude/skills/apfs-dev/scripts/claude-worktree-hook.py" } ] }
+    ],
+    "WorktreeRemove": [
+      { "hooks": [ { "type": "command",
+          "command": "python3 ~/.claude/skills/apfs-dev/scripts/claude-worktree-hook.py" } ] }
     ]
   }
 }
 ```
 
-The hook bases the worktree on the session checkout's `HEAD` and clones ignored paths instead of reading `.worktreeinclude`. Details and the differences from the built-in behavior are in [references/claude-code.md](references/claude-code.md).
+On creation the hook bases the worktree on the session checkout's `HEAD` and clones ignored paths instead of reading `.worktreeinclude`. On removal it refuses to delete a worktree with uncommitted work, removes clean ones, and deletes the `worktree-*` branch only when its commits are contained in another branch. Details and the differences from the built-in behavior are in [references/claude-code.md](references/claude-code.md).
 
 ## Safety
 
@@ -111,7 +115,7 @@ The hook bases the worktree on the session checkout's `HEAD` and clones ignored 
 - `apfs-checkpoint.py restore` swaps the directory atomically and keeps the replaced tree as a `pre-restore-*` checkpoint. Nothing is discarded until `drop`.
 - Dedupe replaces a file only after hashing both copies and verifying data and metadata of the clone. It skips files that are open, mapped, locked or changing, and journals every step for recovery.
 - Transfer never writes to or deletes from the source and never deletes at the destination.
-- Compression leaves files alone that another process has open for writing or mapped, and replaces executables by copy instead of writing them in place.
+- Compression skips files with shared APFS blocks or files that another process has open for writing or mapped. It replaces executables by copy instead of writing them in place.
 
 Limits that apply throughout: open-file detection sees only the current user's processes unless run as root; clone checkpoints and worktree clones are not atomic with respect to concurrent writers; APFS snapshots cannot be created or reverted without privileges, which is why the skill uses clone checkpoints.
 
@@ -139,7 +143,7 @@ sh tests/run.sh --all    # plus cross-volume cases and the dedupe, transfer and 
 ## Status
 
 - Developed and measured on one machine and one macOS version. Behavior of copy tools (which commands clone) changes between OS and runtime versions; `SKILL.md` says how to re-check.
-- `claude-worktree-hook.py` is tested against the documented hook input and output. It has not been exercised from inside a live Claude Code session.
+- `claude-worktree-hook.py` is tested against the documented hook inputs and outputs for both events. It has not been exercised from inside a live Claude Code session.
 - Versions: `apfs-dedupe.py` 1.7.0, `apfs_compress_plus.py` 0.5.0. The other scripts are unversioned.
 
 ## License

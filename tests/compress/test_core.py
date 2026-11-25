@@ -135,8 +135,24 @@ class CoreTests(unittest.TestCase):
                       raised.exception.failures[str(stale)])
         self.assertEqual(content, b"text" * 1024)
 
+    def test_backend_rechecks_current_clone_sharing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory, "source.txt")
+            clone = Path(directory, "clone.txt")
+            source.write_bytes(b"compressible text\n" * 65536)
+            subprocess.run(["/bin/cp", "-c", source, clone], check=True)
+            with mock.patch.object(app, "run_command") as command:
+                with self.assertRaises(app.CompressorRefusedError) as raised:
+                    app.run_compressor(source, "lzfse")
+                self.assertIsInstance(raised.exception.error_for_path(source),
+                                      app.SharedBlocksError)
+                with self.assertRaises(app.SharedBlocksError):
+                    app.recompress_file(source, "lzfse", "zlib")
+                command.assert_not_called()
+
     def test_afsctool_uses_supported_codec_flag_and_one_inner_worker(self):
-        with mock.patch.object(app, "TOOL", "afsctool"), \
+        with mock.patch.object(app, "require_unshared_blocks"), \
+             mock.patch.object(app, "TOOL", "afsctool"), \
              mock.patch.object(app, "BASE", ["afsctool", "-c", "-v"]), \
              mock.patch.object(app.subprocess, "run") as run, \
              mock.patch.object(app, "already_compressed", return_value=True):
@@ -153,7 +169,8 @@ class CoreTests(unittest.TestCase):
         output = SimpleNamespace(
             stdout="", stderr="refused.txt: Operation not permitted\n"
         )
-        with mock.patch.object(app, "TOOL", "afsctool"), \
+        with mock.patch.object(app, "require_unshared_blocks"), \
+             mock.patch.object(app, "TOOL", "afsctool"), \
              mock.patch.object(app, "BASE", ["afsctool", "-c", "-v"]), \
              mock.patch.object(app.subprocess, "run", return_value=output), \
              mock.patch.object(app, "already_compressed", return_value=False), \
@@ -169,7 +186,8 @@ class CoreTests(unittest.TestCase):
             stdout="dense.bin:\nUnable to compress file.\n",
             stderr="Worker thread #0 processed 1 files (0.00%)\n",
         )
-        with mock.patch.object(app, "TOOL", "afsctool"), \
+        with mock.patch.object(app, "require_unshared_blocks"), \
+             mock.patch.object(app, "TOOL", "afsctool"), \
              mock.patch.object(app, "BASE", ["afsctool", "-c", "-v"]), \
              mock.patch.object(app.subprocess, "run",
                                return_value=output) as run, \
@@ -281,7 +299,8 @@ class CoreTests(unittest.TestCase):
         busy = Path("live.db")
         idle = Path("idle.txt")
         users = [{"pid": 7, "command": "Editor", "access": "u"}]
-        with mock.patch.object(app, "TOOL", "afsctool"), \
+        with mock.patch.object(app, "require_unshared_blocks"), \
+             mock.patch.object(app, "TOOL", "afsctool"), \
              mock.patch.object(app, "BASE", ["afsctool", "-c", "-v"]), \
              mock.patch.object(app.OPEN_FILES, "busy",
                                return_value={busy: users}), \
@@ -1215,7 +1234,8 @@ app.ditto_compress_file(Path(sys.argv[1]))
             self.assertEqual(app.compression_algorithm(Path("file")), "lzfse")
 
     def test_recompression_restores_old_codec_after_failure(self):
-        with mock.patch.object(app, "TOOL", "afsctool"), \
+        with mock.patch.object(app, "require_unshared_blocks"), \
+             mock.patch.object(app, "TOOL", "afsctool"), \
              mock.patch.object(app, "BASE", ["afsctool"]), \
              mock.patch.object(app.subprocess, "run"), \
              mock.patch.object(

@@ -12,8 +12,9 @@ import tempfile
 import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from apfs_common import (COPYFILE_ALL, COPYFILE_CLONE, COPYFILE_EXCL, COPYFILE_METADATA,
-                         COPYFILE_NOFOLLOW, PROVENANCE_XATTR, STAGE_PAYLOAD, STAGING_PREFIXES, UNSAFE_FLAGS,
-                         Conflict, Native, hash_fd, make_private_stage, metadata_digest, private_stage_directory,
+                         COPYFILE_NOFOLLOW, PROVENANCE_XATTR, STAGE_PAYLOAD, STAGING_PREFIXES,
+                         UF_COMPRESSED, UNSAFE_FLAGS, Conflict, Native, allocated_bytes, hash_fd,
+                         make_private_stage, metadata_digest, private_stage_directory,
                          remove_private_stage, safe_path, signature, sync_dir, sync_file,
                          tracked_staging_path)
 from apfs_job import Job, Progress, control, default_state
@@ -274,6 +275,9 @@ class Transfer:
             # Preserve hardlink topology separately from CoW duplicate sharing.
             key = 'inode:' + str(source_sig[:2]) if hardlink else 'sha256:' + digest
             keeper = self.find_keeper(key, digest, hardlink, expected_metadata[6].get(PROVENANCE_XATTR))
+            if (keeper is not None and not hardlink and source_sig[8] & UF_COMPRESSED
+                    and allocated_bytes(keeper.lstat()) > allocated_bytes(src.lstat())):
+                keeper = None
         tmp = dst.parent / (PREFIX + uuid.uuid4().hex) / STAGE_PAYLOAD
         directory = make_private_stage(native, tmp.parent)
         work = private_stage_directory(native, tmp.parent, directory) / STAGE_PAYLOAD

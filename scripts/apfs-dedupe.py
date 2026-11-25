@@ -31,6 +31,7 @@ from apfs_common import (EF_SHARES_ALL_BLOCKS, PROVENANCE_XATTR, STAGE_PAYLOAD, 
 from apfs_job import Job, Progress, control, default_state
 
 VERSION = '1.7.0'
+JOURNAL_INDEX_VERSION = 2
 PREFIX = '.apfs-dedupe-stage-'
 COMPRESSED = UF_COMPRESSED
 # Staged clones are exchanged in batches; one open-file snapshot covers a batch.
@@ -67,12 +68,16 @@ def reclaimable_bytes(native, path):
     return allocated_bytes(s)
 
 
-def order_keeper(native, files, completed, root, skip):
+def order_keeper(native, files, completed, origins, root, digest, skip):
     """Move the copy with the smallest allocation first; it becomes the clone source.
 
-    Equal allocations prefer a keeper from a previous run, then the largest
-    APFS clone family in the group. Remaining ties and all destinations keep
-    scan order. Unreadable files are passed to skip and dropped.
+    Equal allocations prefer compressed storage, then the largest APFS clone
+    family in the group, then a file not replaced by a previous run. Remaining
+    ties and all destinations keep scan order. Unreadable files are passed to
+    skip and dropped.
+
+    Track the canonical path separately from the source of the smallest
+    stream. Use that path as the source once it shares the chosen stream.
     """
     known = []
     for path, sig in files:
@@ -80,14 +85,26 @@ def order_keeper(native, files, completed, root, skip):
             known.append((path, sig, native.sharing(path).clone_id, allocated_bytes(path.lstat())))
         except OSError as e:
             skip(path, e)
-    families = Counter(clone_id for _, _, clone_id, _ in known if clone_id is not None)
+    families = Counter(clone_id for _, _, clone_id, _ in known if clone_id)
     def rank(index):
         path, sig, clone_id, allocated = known[index]
-        return allocated, completed.get(str(path.relative_to(root))) == sig, -families.get(clone_id, 1)
+        return (allocated, not bool(sig[8] & COMPRESSED), -families.get(clone_id, 1),
+                completed.get(str(path.relative_to(root))) == sig)
     if not known:
-        return []
+        return [], None
     keeper = min(range(len(known)), key=rank)
-    return [x[:3] for x in [known[keeper]] + known[:keeper] + known[keeper + 1:]]
+    source, _, clone_id, _ = known[keeper]
+    canonical = str(source.relative_to(root))
+    origin = origins.get(canonical)
+    if origin and origin[0] == digest and origin[1] != canonical:
+        for index, (path, _, candidate_id, _) in enumerate(known):
+            if str(path.relative_to(root)) == origin[1]:
+                canonical = origin[1]
+                if clone_id and candidate_id == clone_id:
+                    keeper = index
+                break
+    known.insert(0, known.pop(keeper))
+    return [item[:3] for item in known], canonical
 
 
 def measured_hash(fd, on_bytes=None, metrics=None):
@@ -296,8 +313,18 @@ class DiskRecords:
                 raise Conflict('Invalid journal: conflict without stage')
             value['conflict'] = True
         elif event == 'done':
+            stage = SignatureMap(self, 'pending').get(record['id'])
             db.execute("DELETE FROM dedupe_history WHERE kind='pending' AND key=?", (record['id'],))
             kind, key, value = 'done', record['destination'], record['signature']
+            if stage and stage.get('source') and stage.get('sha256'):
+                source, digest = stage['source'], stage['sha256']
+                canonical = stage.get('canonical_keeper')
+                if canonical is None:
+                    # Legacy records only name the physical clone source.
+                    origin = SignatureMap(self, 'origin').get(source)
+                    canonical = origin[1] if origin and origin[0] == digest else source
+                db.execute('INSERT OR REPLACE INTO dedupe_history VALUES (?,?,?)',
+                           ('origin', key, json.dumps([digest, canonical])))
         elif event == 'excluded':
             kind, key, value = 'excluded', record['destination'], record['signature']
         elif event == 'aborted':
@@ -314,7 +341,7 @@ class DiskRecords:
 def load_disk_records(fd, compressed, job, path, root):
     records = DiskRecords(job)
     cached = job.get('journal-index', str(path), signature(os.fstat(fd)))
-    if cached is not None:
+    if cached is not None and cached.get('version') == JOURNAL_INDEX_VERSION:
         validate_header(records, root)
         return records, cached['end']
     job.db.execute("DELETE FROM cache WHERE kind='journal-index'")
@@ -334,7 +361,7 @@ def load_disk_records(fd, compressed, job, path, root):
                         bytes_done=os.lseek(fd, 0, os.SEEK_CUR), bytes_total=os.fstat(fd).st_size)
     _, end = journal_records(fd, compressed, on_record=consume)
     validate_header(records, root)
-    job.put('journal-index', str(path), signature(os.fstat(fd)), {'end': end})
+    job.put('journal-index', str(path), signature(os.fstat(fd)), {'end': end, 'version': JOURNAL_INDEX_VERSION})
     job.flush()
     return records, end
 
@@ -379,7 +406,9 @@ class Journal:
             raise Conflict('Journal write failed: ' + str(e)) from e
         self.records.append(record)
         if self.job:
-            self.job.put('journal-index', str(self.path), signature(os.fstat(self.fd)), {'end': os.fstat(self.fd).st_size})
+            stat = os.fstat(self.fd)
+            self.job.put('journal-index', str(self.path), signature(stat),
+                         {'end': stat.st_size, 'version': JOURNAL_INDEX_VERSION})
 
     def recover(self, open_files):
         """Settle interrupted replacements; open_files is Native.open_files."""
@@ -518,7 +547,8 @@ def discard_stage(native, journal, ident, tmp, directory):
     journal.add(event='aborted', id=ident)
 
 
-def prepare(native, root, src, dst, digest, expected_src, expected_dst, journal, cache=None, on_bytes=None, busy=()):
+def prepare(native, root, src, dst, digest, expected_src, expected_dst, journal,
+            cache=None, on_bytes=None, busy=(), canonical_keeper=None):
     """Stage a verified clone of src beside dst for publish(); dst is not touched.
 
     Raises Skip when dst is open or mapped elsewhere (busy is a recent
@@ -563,7 +593,7 @@ def prepare(native, root, src, dst, digest, expected_src, expected_dst, journal,
         journal.add(event='stage', id=ident, destination=relative, source=str(src.relative_to(root)),
                     temporary=str(tmp.relative_to(root)), staging_directory=directory,
                     sha256=digest, original=expected_dst, metadata_digest=fingerprint,
-                    original_generation=generation)
+                    original_generation=generation, canonical_keeper=canonical_keeper)
         journaled = True
         native.clone(src, work)
         native.restore(work, metadata, ds.st_atime_ns)
@@ -858,7 +888,7 @@ def select_units(planned, dir_groups, limit):
                 owned = True
         if owned:
             continue
-        key = change['size_bytes'], change['sha256']
+        key = change['size_bytes'], change['sha256'], change['source']
         if key not in by_content:
             by_content[key] = len(units)
             units.append({'kind': 'file', 'sha256': change['sha256'], 'size_bytes': change['size_bytes'],
@@ -892,7 +922,8 @@ def select_units(planned, dir_groups, limit):
                           files_per_directory=unit['files_per_directory'],
                           bytes_per_directory=unit['bytes_per_directory'])
         else:
-            record.update(sha256=unit['sha256'], size_bytes=unit['size_bytes'], source=unit['source'])
+            record.update(sha256=unit['sha256'], size_bytes=unit['size_bytes'],
+                          source=unit['source'], canonical_keeper=changes[0]['canonical_keeper'])
         record.update(destinations=[c['destination'] for c in changes], planned_files=len(changes),
                       logical_duplicate_bytes=sum(c['size_bytes'] for c in changes),
                       estimated_physical_bytes=sum(c['estimated_physical_bytes'] for c in changes),
@@ -953,7 +984,11 @@ def print_top(units, applied, shown=3):
             more = f'; {hidden:,} more clones in --json' if hidden > 0 else ''
             print(f'{head}{u["planned_files"]:,} x {human_bytes(u["size_bytes"])}{status}  '
                   f'sha256 {u["sha256"][:12]}{more}')
-            entries.append((u['source'], f'#{u["rank"]} keep', False))
+            using_other_source = u['canonical_keeper'] != u['source']
+            if using_other_source:
+                print(f'      Canonical keeper {u["canonical_keeper"]}')
+            source_role = 'donor' if using_other_source else 'keep'
+            entries.append((u['source'], f'#{u["rank"]} {source_role}', False))
             entries += [(d, f'#{u["rank"]} clone', False) for d in u['destinations'][:shown]]
     print()
     for line in path_tree(entries):
@@ -1110,7 +1145,10 @@ EPILOG = '''examples:
 what is deduplicated:
   Regular files on ROOT's volume with identical contents and identical
   com.apple.provenance. Compressed and sparse files are included; in each
-  group the copy using the least space is kept. Skipped: symlinks, hard
+  group the copy using the least space is kept. Files sharing that copy's
+  APFS data stream are skipped. When a journaled clone has the smallest
+  stream, its original keeper retains the canonical path if it is still
+  in the same duplicate group. Skipped: symlinks, hard
   links, empty files, files owned by others, special files, protected or
   setuid/setgid files, .git and --exclude names.
 
@@ -1252,15 +1290,18 @@ def main(argv=None):
                 job = Job(Path(temporary_state.name), {'tool': 'dedupe-preview', 'root': str(root)})
                 progress.job = job
             completed, previous_exclusions = read_completed(read_path, root, job=job)
+        origins = {}
+        if job and (args.apply or read_path.exists()):
+            origins = SignatureMap(DiskRecords(job), 'origin')
         groups, scanned, excluded, unmatched = scan(root, args.min_size, {'.git', *args.exclude}, jp, progress, native, skip)
         planned, tasks = [], []
         progress.start('Planning replacements', sum(len(paths) - 1 for _, paths in groups),
                        sum(key[0] * (len(paths) - 1) for key, paths in groups))
         already = already_shared = 0
         for (size, digest), files in groups:
-            files = order_keeper(native, files, completed, root, skip)
-            for dst, ds, dst_id in files[1:]:
-                src, ss, src_id = files[0]
+            files, canonical = order_keeper(native, files, completed, origins, root, digest, skip)
+            for dst, ds, dst_clone_id in files[1:]:
+                src, ss, src_clone_id = files[0]
                 progress.current_path = str(dst)
                 progress.count += 1
                 progress.bytes += size
@@ -1269,14 +1310,15 @@ def main(argv=None):
                 if previous_exclusions.get(rel) == ds:
                     unmatched.append(rel)
                     continue
-                done = completed.get(rel) == ds
-                if src_id and src_id == dst_id:
-                    if done:
-                        already += 1
-                    else:
-                        already_shared += 1
-                    continue
-                if done and not (src_id and dst_id):
+                journaled = completed.get(rel) == ds
+                if src_clone_id and dst_clone_id:
+                    if src_clone_id == dst_clone_id:
+                        if journaled:
+                            already += 1
+                        else:
+                            already_shared += 1
+                        continue
+                elif journaled:
                     already += 1
                     continue
                 try:
@@ -1285,9 +1327,9 @@ def main(argv=None):
                     skip(dst, e)
                     continue
                 planned.append({'source': str(src.relative_to(root)), 'destination': rel,
-                                'size_bytes': size, 'sha256': digest,
+                                'canonical_keeper': canonical, 'size_bytes': size, 'sha256': digest,
                                 'estimated_physical_bytes': estimate})
-                tasks.append((src, dst, digest, ss, ds, size))
+                tasks.append((src, dst, digest, ss, ds, size, canonical))
         progress.report(force=True)
         deferred = []
         if args.top is not None:
@@ -1318,7 +1360,7 @@ def main(argv=None):
                         changed_bytes += sizes[item.ident]
                         cloned.add(item.relative)
             try:
-                for src, dst, digest, ss, ds, size in tasks:
+                for src, dst, digest, ss, ds, size, canonical in tasks:
                     progress.current_path = str(dst)
                     progress.checkpoint()
                     try:
@@ -1329,7 +1371,7 @@ def main(argv=None):
                                 job.snapshot['current_file_bytes'] += n
                             progress.report()
                         item = prepare(native, root, src, dst, digest, ss, ds, journal, cache=job,
-                                       on_bytes=clone_bytes, busy=busy)
+                                       on_bytes=clone_bytes, busy=busy, canonical_keeper=canonical)
                         sizes[item.ident] = size
                         batch.append(item)
                     except ProvenanceMismatch as e:
