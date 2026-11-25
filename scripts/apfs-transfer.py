@@ -2,7 +2,6 @@
 """Checkpointed macOS tree transfer with destination APFS duplicate sharing."""
 import argparse
 import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,8 +12,10 @@ import tempfile
 import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from apfs_common import (COPYFILE_ALL, COPYFILE_CLONE, COPYFILE_EXCL, COPYFILE_METADATA,
-                         COPYFILE_NOFOLLOW, PROVENANCE_XATTR, UNSAFE_FLAGS, Conflict, Native,
-                         hash_fd, safe_path, signature, sync_dir, sync_file)
+                         COPYFILE_NOFOLLOW, PROVENANCE_XATTR, STAGE_PAYLOAD, STAGING_PREFIXES, UNSAFE_FLAGS,
+                         Conflict, Native, hash_fd, make_private_stage, metadata_digest, private_stage_directory,
+                         remove_private_stage, safe_path, signature, sync_dir, sync_file,
+                         tracked_staging_path)
 from apfs_job import Job, Progress, control, default_state
 
 PREFIX = '.apfs-transfer-stage-'
@@ -102,20 +103,13 @@ def ensure_unchanged(path, expected):
         raise Conflict('Changed since checkpoint: ' + str(path))
 
 
-def metadata_digest(value):
-    mode, uid, gid, flags, mtime, birthtime, attrs, acl = value
-    payload = [mode, uid, gid, flags, mtime, birthtime.hex(), sorted((k.hex(), v.hex()) for k, v in attrs.items()), acl.hex()]
-    return hashlib.sha256(json.dumps(payload).encode()).hexdigest()
-
-
 def recover(job, destination, native, progress):
     """Settle files that an interrupted run left staged or just published."""
     for rel, raw in job.db.execute("SELECT path,value FROM cache WHERE kind='pending'").fetchall():
         value = json.loads(raw)
-        dst, tmp = safe_path(destination, rel), safe_path(destination, value['temporary'])
-        if tmp.parent != dst.parent or not tmp.name.startswith(PREFIX):
-            raise Conflict('Invalid transfer staging record')
-        if exists(tmp):
+        dst = safe_path(destination, rel)
+        name, tmp = tracked_staging_path(native, destination, dst, value, PREFIX)
+        if tmp is not None and exists(tmp):
             s = tmp.lstat()
             if s.st_uid != os.geteuid() or not (stat.S_ISREG(s.st_mode) or stat.S_ISLNK(s.st_mode)):
                 raise Conflict('Unsafe staging file: ' + str(tmp))
@@ -141,6 +135,8 @@ def recover(job, destination, native, progress):
                 job.put('done', rel, [value['source_signature'], actual], value['result'])
             elif actual[:2] == expected[:2]:
                 raise Conflict('Published file changed before recovery: ' + str(dst))
+        if 'staging_directory' in value:
+            remove_private_stage(native, name, value['staging_directory'])
         job.db.execute("DELETE FROM cache WHERE kind='pending' AND path=?", (rel,))
         job.flush()
 
@@ -161,6 +157,12 @@ def manifest(job, source, exclusions, progress):
             if name in exclusions:
                 if name in dirs:
                     dirs.remove(name)
+                continue
+            if name in dirs and name.startswith(STAGING_PREFIXES) and not path.is_symlink():
+                with os.scandir(path) as entries:
+                    if next(entries, None) is not None:
+                        raise Conflict('Source contains a pending APFS staging directory: ' + str(path))
+                dirs.remove(name)
                 continue
             if name != '.' and path.is_dir() and not path.is_symlink():
                 continue
@@ -272,41 +274,56 @@ class Transfer:
             # Preserve hardlink topology separately from CoW duplicate sharing.
             key = 'inode:' + str(source_sig[:2]) if hardlink else 'sha256:' + digest
             keeper = self.find_keeper(key, digest, hardlink, expected_metadata[6].get(PROVENANCE_XATTR))
-        tmp = dst.parent / (PREFIX + uuid.uuid4().hex)
-        record = {'temporary': str(tmp.relative_to(self.destination)), 'source_signature': source_sig}
+        tmp = dst.parent / (PREFIX + uuid.uuid4().hex) / STAGE_PAYLOAD
+        directory = make_private_stage(native, tmp.parent)
+        work = private_stage_directory(native, tmp.parent, directory) / STAGE_PAYLOAD
+        record = {'temporary': str(tmp.relative_to(self.destination)),
+                  'staging_directory': directory, 'source_signature': source_sig}
         if keeper is not None and hardlink:
             record['hardlink_keeper'] = str(keeper.relative_to(self.destination))
         job.put('pending', rel, [], record)
         job.flush()  # Must be durable before staging; never batch this commit.
         if keeper is not None and hardlink:
-            os.link(keeper, tmp, follow_symlinks=False)
+            os.link(keeper, work, follow_symlinks=False)
             self.hardlinked += 1
         elif keeper is not None:
-            native.clone(keeper, tmp)
-            native.restore(tmp, expected_metadata, src.stat().st_atime_ns)
+            native.clone(keeper, work)
+            native.restore(work, expected_metadata, src.stat().st_atime_ns)
             self.cloned += 1
         else:
             job.publish(activity='Copying data', current_file_bytes=0)
-            copyfile(native, src, tmp, progress=progress)
-        native.set_birth(tmp, expected_metadata[5], nofollow=True)
+            copyfile(native, src, work, progress=progress)
+        native.set_birth(work, expected_metadata[5], nofollow=True)
         if kind == 'file':
             job.publish(activity='Verifying staged file', current_file_bytes=0)
-            if hash_regular(tmp, progress) != digest:
+            if hash_regular(work, progress) != digest:
                 raise Conflict('Copied checksum differs; original destination retained: ' + rel)
-        elif os.readlink(src) != os.readlink(tmp):
+        elif os.readlink(src) != os.readlink(work):
             raise Conflict('Copied symlink differs: ' + rel)
-        if metadata(native, tmp) != expected_metadata:
+        if metadata(native, work) != expected_metadata:
             raise Conflict('Copied metadata differs; original destination retained: ' + rel)
         ensure_unchanged(src, source_sig)
         ensure_unchanged(dst, dest_sig)
         if kind == 'file':
-            sync_file(tmp)
-        record.update(prepared=sig(tmp), metadata_digest=metadata_digest(expected_metadata),
-                      result={'sha256': digest, 'symlink_target': os.readlink(tmp) if kind == 'symlink' else None})
+            sync_file(work)
+        sync_dir(work.parent)
+        record.update(prepared=sig(work), metadata_digest=metadata_digest(expected_metadata),
+                      result={'sha256': digest, 'symlink_target': os.readlink(work) if kind == 'symlink' else None})
         job.put('pending', rel, [], record)
         job.flush()
-        os.replace(tmp, dst)
+        private_stage_directory(native, tmp.parent, directory)
+        ensure_unchanged(work, record['prepared'])
+        ensure_unchanged(dst, dest_sig)
+        if dest_sig is None:
+            try:
+                native.rename_exclusive(work, dst)
+            except FileExistsError as error:
+                raise Conflict('Destination appeared during transfer: ' + str(dst)) from error
+        else:
+            os.replace(work, dst)
         sync_dir(dst.parent)
+        sync_dir(work.parent)
+        remove_private_stage(native, tmp, directory)
         final_sig = sig(dst)
         job.put('done', rel, [source_sig, final_sig], record['result'])
         if digest is not None:

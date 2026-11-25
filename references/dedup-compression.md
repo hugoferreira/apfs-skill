@@ -1,5 +1,33 @@
 # Deduplication and transparent compression
 
+## Run both on one directory
+
+```bash
+python3 "$APFS_DEV"/scripts/apfs-reclaim.py "$PWD"          # preview
+python3 "$APFS_DEV"/scripts/apfs-reclaim.py "$PWD" --apply  # run both
+```
+
+The preview assesses the files currently on disk and writes temporary reports outside the target. Its two savings figures can overlap. Apply compresses eligible cold files before cloning duplicates, so compatible copies can share the compressed blocks. The built-in `ditto` backend requires macOS and Python 3.12 or later for compression. The launcher searches PATH and standard Homebrew locations when started with Python 3.9–3.11.
+
+Apply prints a state directory outside the target. Keep the target's `.apfs-dedupe.jsonl.gz` recovery journal. After an interruption, rerun with the same root and `--state-dir DIR` to reuse the compression records and hash cache. The state directory contains a subdirectory for each run's before/after inspection and full per-file reports. To monitor dedupe directly, use `apfs-dedupe.py ROOT --state-dir DIR/dedupe --control status --json`. Allow large trees time for hashing, metadata verification and journaled replacement. Run one mutating job at a time on overlapping trees.
+
+`--json` emits one result with `before`, `compression`, `dedupe`, and (on apply) `after` summaries. Progress goes to stderr. Exit 0 means both phases completed, 1 means a failure or partial execution, 2 means invalid arguments, and 130 means interrupted. Dedupe can complete with skipped files and reports their counts. The underlying commands support per-phase tuning and detailed previews.
+
+Use the before/after APFS allocation estimate for the overall reduction. Compression reports the reduction in verified per-file allocation. Dedupe separately estimates the private allocation released by completed clone replacements. A local snapshot may hold old blocks, and volume free space can change during a read-only scan. Files with a decmpfs header and a missing compression flag are reported as a pre-existing condition. For a separate repair assessment, use `apfs_compress_plus.py file repair ROOT --dry-run`.
+
+macOS can generate a different `com.apple.provenance` value in a staged clone even when the two originals have identical values. The tool preserves the original in that case. Dedupe remembers stable refusals in its journal, so retries can focus on candidates that were open or changed during the run.
+
+Darwin can hide an independent resource fork on a file whose compressed payload is stored inline. The verification code uses `XATTR_SHOWCOMPRESSION` to detect hidden attributes. It permits a hidden resource fork only for known fork-backed decmpfs types and declines replacements when it cannot verify the hidden metadata.
+
+Staged compression uses a durable per-file journal and `RENAME_SWAP`. The tool rechecks the displaced original's APFS generation and metadata, including xattrs and ACLs. If the original changed or was opened during the exchange, the tool restores it when the installed copy is still unchanged. It keeps both versions when either could be lost during rollback.
+
+If compression reports a pending publication, inspect and recover that file or tree before retrying. Keep the private stage until recovery is complete. If recovery reports a conflict, compare both paths it names and retain the desired versions before clearing the stage.
+
+```bash
+python3 "$APFS_DEV"/scripts/apfs_compress_plus.py file repair ROOT --only interrupted_swap --dry-run --json
+python3 "$APFS_DEV"/scripts/apfs_compress_plus.py file repair ROOT --only interrupted_swap
+```
+
 ## Deduplication with clones
 
 APFS has no online block-level dedup. Identical files can be replaced by clones of one keeper, after which they share blocks but remain independent, writable files.
@@ -11,7 +39,7 @@ python3 ~/.claude/skills/apfs-dev/scripts/apfs-dedupe.py ROOT --top 10 --apply -
 python3 ~/.claude/skills/apfs-dev/scripts/apfs-dedupe.py ROOT --control status --json
 ```
 
-Safety properties (full detail in apfs-tools.md): SHA-256 verified, per-file atomic replacement with `renamex_np(RENAME_SWAP)`, metadata (mode, owner, times, xattrs, ACLs) preserved and verified, files open/mapped/locked/changing are skipped, `com.apple.provenance` mismatches never merged, resumable journal at `ROOT/.apfs-dedupe.jsonl.gz`. Skips `.git` by default. Inodes and ctime change, so tools tracking inodes see a new file.
+Safety properties (full detail in apfs-tools.md): SHA-256 verified, per-file atomic replacement with `renamex_np(RENAME_SWAP)`, metadata (mode, owner, times, xattrs, ACLs) preserved and verified, files open/mapped/locked/changing are skipped, `com.apple.provenance` mismatches never merged, resumable journal at `ROOT/.apfs-dedupe.jsonl.gz`. Files already in the keeper's clone family and `.git` are skipped. Replaced files get new inodes and ctime.
 
 Good targets in a dev environment: multiple checkouts and their `node_modules`, toolchain/SDK versions with shared files, `~/.cache` and package caches that copied instead of cloning, Docker build contexts, datasets duplicated per experiment. Bad targets: trees whose files are rewritten constantly (savings vanish), `.git/objects` (already content-addressed and packed).
 
@@ -59,11 +87,11 @@ Tools:
   python3 ~/.claude/skills/apfs-dev/scripts/apfs_compress_plus.py system doctor
   ```
 
-  Mutating commands need `afsctool` (installed at /opt/homebrew/bin) unless `--backend applesauce|ditto`. `system doctor` checks tools, state and target volumes.
+  Mutating commands use `afsctool` by default. Pass `--backend ditto` for built-in LZVN compression without installing anything, or `--backend applesauce` if it is already installed. With `ditto`, the tool verifies staged copies for reduced allocation, byte-for-byte contents, and preserved metadata. On macOS builds that omit `UF_COMPRESSED` when staging, it restores the flag on the stage and verifies that the data reads back before publishing. A protected provenance attribute can prevent safe replacement. `system doctor` checks tools, state and target volumes.
 - `afsctool` (`brew install afsctool`): `-c` compress, `-d` decompress, `-v` show method and ratio, `-T LZFSE|LZVN|ZLIB`, `-j N` parallel.
 - `applesauce` (Rust): compress/decompress/info, refuses to grow files.
 
-Interaction with clones: cloning a compressed file shares the compressed blocks (refcnt increases, `compressed` flag kept). Compressing a file that has clones gives it new private blocks; the clones keep the old uncompressed ones, so compressing one member of a clone family can increase usage. Dedupe first, then compress the keeper, or compress before cloning.
+Cloning a compressed file shares the compressed blocks and keeps the compression flag. Compress before deduplication so the group can share those blocks. Compressing just one member of an existing clone family can increase usage because other members keep the old blocks. The staged `ditto` backend only publishes a compressed copy if it uses less space than the source's private allocation.
 
 ## Sources
 

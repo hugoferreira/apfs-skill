@@ -6,7 +6,6 @@ A file that is open elsewhere, locked, changing or gone is skipped, not replaced
 """
 import argparse
 from collections import Counter, defaultdict
-import contextlib
 import fcntl
 import gzip
 import heapq
@@ -22,10 +21,13 @@ import sqlite3
 import tempfile
 from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from apfs_common import (EF_SHARES_ALL_BLOCKS, PROVENANCE_XATTR, UF_COMPRESSED, UNSAFE_FLAGS,
-                         Conflict, Native, allocated_bytes, free_bytes, hash_fd,
-                         human_bytes, lstat_or_none, safe_path, signature, sync_dir, sync_file,
-                         unchanged)
+from apfs_common import (EF_SHARES_ALL_BLOCKS, PROVENANCE_XATTR, STAGE_PAYLOAD, STAGING_PREFIXES,
+                         UF_COMPRESSED, UNSAFE_FLAGS,
+                         XATTR_NOFOLLOW, Conflict, Native, allocated_bytes, file_checkpoint,
+                         free_bytes, hash_fd, human_bytes, lstat_or_none, make_private_stage,
+                         matches_checkpoint, metadata_digest, private_stage_directory,
+                         remove_private_stage, safe_path, signature, sync_dir, sync_file,
+                         tracked_staging_path, unchanged)
 from apfs_job import Job, Progress, control, default_state
 
 VERSION = '1.7.0'
@@ -68,11 +70,9 @@ def reclaimable_bytes(native, path):
 def order_keeper(native, files, completed, root, skip):
     """Move the copy with the smallest allocation first; it becomes the clone source.
 
-    A file already replaced by an earlier run is not preferred, so reruns do not
-    switch keepers. Equal allocations prefer the largest APFS clone family in the
-    group, whose shared blocks then remain shared. Remaining ties, and all
-    destinations, keep scan order. Files that can no longer be read are passed
-    to skip and dropped.
+    Equal allocations prefer a keeper from a previous run, then the largest
+    APFS clone family in the group. Remaining ties and all destinations keep
+    scan order. Unreadable files are passed to skip and dropped.
     """
     known = []
     for path, sig in files:
@@ -83,11 +83,11 @@ def order_keeper(native, files, completed, root, skip):
     families = Counter(clone_id for _, _, clone_id, _ in known if clone_id is not None)
     def rank(index):
         path, sig, clone_id, allocated = known[index]
-        return completed.get(str(path.relative_to(root))) == sig, allocated, -families.get(clone_id, 1)
+        return allocated, completed.get(str(path.relative_to(root))) == sig, -families.get(clone_id, 1)
     if not known:
         return []
     keeper = min(range(len(known)), key=rank)
-    return [x[:2] for x in [known[keeper]] + known[:keeper] + known[keeper + 1:]]
+    return [x[:3] for x in [known[keeper]] + known[:keeper] + known[keeper + 1:]]
 
 
 def measured_hash(fd, on_bytes=None, metrics=None):
@@ -287,6 +287,8 @@ class DiskRecords:
             if value is None:
                 raise Conflict('Invalid journal: prepared without stage')
             value['prepared'] = record['signature']
+            if 'generation' in record:
+                value['replacement_generation'] = record['generation']
         elif event == 'conflict':
             kind, key = 'pending', record['id']
             value = SignatureMap(self, kind).get(key)
@@ -392,6 +394,8 @@ class Journal:
                 if r['id'] not in pending:
                     raise Conflict('Invalid journal: prepared without stage')
                 pending[r['id']]['prepared'] = r['signature']
+                if 'generation' in r:
+                    pending[r['id']]['replacement_generation'] = r['generation']
             elif r['event'] == 'conflict':
                 if r['id'] not in pending:
                     raise Conflict('Invalid journal: conflict without stage')
@@ -401,32 +405,59 @@ class Journal:
                 pending.pop(r['id'], None)
             elif r['event'] == 'aborted':
                 pending.pop(r['id'], None)
+        native = Native() if pending else None
         for ident, r in list(pending.items()):
-            dst, tmp = safe_path(self.root, r['destination']), safe_path(self.root, r['temporary'])
-            if tmp.parent != dst.parent or not tmp.name.startswith(PREFIX):
-                raise Conflict('Invalid staging path in journal')
+            dst = safe_path(self.root, r['destination'])
+            name, tmp = tracked_staging_path(native, self.root, dst, r, PREFIX)
+            directory = r.get('staging_directory')
             staged, original = r.get('prepared'), r.get('original')
-            s = lstat_or_none(tmp)
+            fingerprint = r.get('metadata_digest')
+            replacement = dict(signature=staged, metadata=fingerprint,
+                               generation=r.get('replacement_generation'))
+            s = lstat_or_none(tmp) if tmp is not None else None
             if s is not None:
                 if not stat.S_ISREG(s.st_mode) or s.st_uid != os.geteuid() or s.st_nlink != 1:
                     raise Conflict('Unsafe staging file: ' + str(tmp))
                 if staged and original and signature(s)[:2] == original[:2] != staged[:2]:
                     # Interrupted after the exchange: the staging name holds the original.
                     if r.get('conflict'):
-                        raise Conflict(conflict_message(tmp, dst))
+                        raise Conflict(conflict_message(name, dst))
                     busy = open_files()
                     try:
-                        settle_swapped(tmp, dst, staged, tuple(staged[:2]) in busy,
-                                       unchanged(signature(s), original) and tuple(original[:2]) not in busy)
+                        original_checkpoint = None
+                        if fingerprint is not None:
+                            original_checkpoint = dict(signature=original, metadata=fingerprint,
+                                                       generation=r.get('original_generation'))
+                        else:
+                            # A legacy journal has no metadata fingerprint. A rollback is
+                            # safe only when the replacement still has the recorded bytes
+                            # and both files have equivalent user-visible metadata.
+                            try:
+                                if hash_file(dst)[0] != r['sha256']:
+                                    raise Conflict(conflict_message(name, dst))
+                                current = file_checkpoint(native, dst)
+                                if current['metadata'] != metadata_digest(native.metadata(tmp, nofollow=True)):
+                                    raise Conflict(conflict_message(name, dst))
+                                replacement.update(metadata=current['metadata'],
+                                                   generation=current['generation'])
+                            except (Skip, OSError) as error:
+                                raise Conflict(conflict_message(name, dst)) from error
+                        settle_swapped(native, tmp, dst, replacement, tuple(staged[:2]) in busy,
+                                       original_checkpoint, display=name)
                     except Conflict:
                         self.add(event='conflict', id=ident)
                         raise
-                elif staged and signature(s) != staged:
-                    raise Conflict('Staging file changed: ' + str(tmp))
                 else:
+                    if staged and (signature(s) != staged or fingerprint is not None):
+                        # The ctime may have changed during an interrupted rollback.
+                        if (fingerprint is None or tuple(staged[:2]) in open_files()
+                                or not matches_checkpoint(native, tmp, replacement)):
+                            raise Conflict('Staging file changed or is open: ' + str(name))
                     tmp.unlink()
                     sync_dir(tmp.parent)
-            elif staged and lstat_or_none(dst) is not None:
+            if directory is not None:
+                remove_private_stage(native, name, directory)
+            if s is None and staged and lstat_or_none(dst) is not None:
                 try:
                     digest, sig = hash_file(dst)
                 except (Skip, OSError):
@@ -443,34 +474,47 @@ class Journal:
 
 
 def conflict_message(tmp, dst):
-    return (f'{dst} was written while its original, now {tmp}, was still in use; both are kept. '
+    return (f'Conflicting versions at {dst} and {tmp}. For recovery, both are kept. '
             f'Keep the wanted version at {dst}, remove {tmp}, then rerun')
 
 
-def settle_swapped(tmp, dst, staged, clone_open, original_intact):
+def settle_swapped(native, tmp, dst, replacement, clone_open, original_checkpoint, display=None):
     """Reverse an exchange that was not confirmed. tmp holds the original, dst held the clone.
 
     The original returns to dst while the clone there is unwritten and unopened.
     Otherwise the path carries newer data: the clone stands, and the original
     is removed if it is known to be unmodified and unused. If neither side can
     be discarded without losing data, both are kept and Conflict is raised.
-    A clone opened between this check and the rename is not detected.
+    The rollback also exchanges names, so a change to the clone during the
+    rollback remains recoverable under the stage name.
     """
-    current = lstat_or_none(dst)
-    if current is not None and unchanged(signature(current), staged) and not clone_open:
-        os.replace(tmp, dst)
-    elif original_intact:
+    if not clone_open and matches_checkpoint(native, dst, replacement):
+        native.swap(tmp, dst)
+        sync_dir(dst.parent)
+        if tmp.parent != dst.parent:
+            sync_dir(tmp.parent)
+        if (tuple(replacement['signature'][:2]) in native.open_files(mappings=False)
+                or not matches_checkpoint(native, tmp, replacement)):
+            raise Conflict(conflict_message(display or tmp, dst))
+        tmp.unlink()
+    elif (original_checkpoint is not None
+          and tuple(original_checkpoint['signature'][:2]) not in native.open_files(mappings=False)
+          and matches_checkpoint(native, tmp, original_checkpoint)):
         tmp.unlink()
     else:
-        raise Conflict(conflict_message(tmp, dst))
-    sync_dir(dst.parent)
+        raise Conflict(conflict_message(display or tmp, dst))
+    sync_dir(tmp.parent)
+    if tmp.parent != dst.parent:
+        sync_dir(dst.parent)
 
 
-def discard_stage(journal, ident, tmp):
+def discard_stage(native, journal, ident, tmp, directory):
     """Remove an unpublished clone and close its journal entry."""
-    with contextlib.suppress(FileNotFoundError):
-        tmp.unlink()
-        sync_dir(tmp.parent)
+    anchor = private_stage_directory(native, tmp.parent, directory, missing_ok=True)
+    if anchor is not None:
+        (anchor / STAGE_PAYLOAD).unlink(missing_ok=True)
+        sync_dir(anchor)
+        remove_private_stage(native, tmp, directory)
     journal.add(event='aborted', id=ident)
 
 
@@ -482,14 +526,17 @@ def prepare(native, root, src, dst, digest, expected_src, expected_dst, journal,
     """
     src, dst = safe_path(root, str(src.relative_to(root))), safe_path(root, str(dst.relative_to(root)))
     ident = uuid.uuid4().hex
-    tmp = dst.parent / (PREFIX + ident)
+    tmp = dst.parent / (PREFIX + ident) / STAGE_PAYLOAD
     relative = str(dst.relative_to(root))
     journaled = False
     source_fd = fd = None
     try:
         source_fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        if signature(os.fstat(source_fd)) != expected_src or signature(src.lstat()) != expected_src:
+        source_stat = os.fstat(source_fd)
+        if signature(source_stat) != expected_src or signature(src.lstat()) != expected_src:
             raise Skip('Kept copy changed since scan', src)
+        if source_stat.st_flags & COMPRESSED:
+            native.require_verified_compression_xattrs(src)
         fd = os.open(dst, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         if signature(os.fstat(fd)) != expected_dst or signature(dst.lstat()) != expected_dst:
             raise Skip('Changed since scan', dst)
@@ -510,16 +557,21 @@ def prepare(native, root, src, dst, digest, expected_src, expected_dst, journal,
             raise Skip('Contents changed since scan', dst)
         ds = os.fstat(fd)
         metadata = native.metadata(dst)
+        fingerprint = metadata_digest(metadata)
+        directory = make_private_stage(native, tmp.parent)
+        work = private_stage_directory(native, tmp.parent, directory) / STAGE_PAYLOAD
         journal.add(event='stage', id=ident, destination=relative, source=str(src.relative_to(root)),
-                    temporary=str(tmp.relative_to(root)), sha256=digest, original=expected_dst)
+                    temporary=str(tmp.relative_to(root)), staging_directory=directory,
+                    sha256=digest, original=expected_dst, metadata_digest=fingerprint,
+                    original_generation=generation)
         journaled = True
-        native.clone(src, tmp)
-        native.restore(tmp, metadata, ds.st_atime_ns)
+        native.clone(src, work)
+        native.restore(work, metadata, ds.st_atime_ns)
         # Hashing the clone, not src, covers a src written while it was cloned.
-        actual, _ = hash_file(tmp, on_bytes=on_bytes, metrics=cache)
+        actual, _ = hash_file(work, on_bytes=on_bytes, metrics=cache)
         if actual != digest:
             raise Skip('Kept copy changed while cloning', src)
-        copied_metadata = native.metadata(tmp)
+        copied_metadata = native.metadata(work)
         if copied_metadata != metadata:
             labels = ['mode', 'uid', 'gid', 'flags', 'mtime', 'birthtime', 'xattrs', 'ACL']
             differences = [name for name, a, b in zip(labels, metadata, copied_metadata) if a != b]
@@ -529,25 +581,30 @@ def prepare(native, root, src, dst, digest, expected_src, expected_dst, journal,
             if differences == ['xattrs', os.fsdecode(PROVENANCE_XATTR)]:
                 # Some provenance is regenerated by clonefile itself. Preserve
                 # the original and journal the exclusion for subsequent runs.
-                discard_stage(journal, ident, tmp)
+                discard_stage(native, journal, ident, tmp, directory)
                 journaled = False
                 journal.add(event='excluded', destination=relative,
                             signature=expected_dst, reason='provenance_not_preserved')
                 raise ProvenanceMismatch('macOS did not preserve com.apple.provenance: ' + str(dst))
             raise Skip('Clone metadata failed verification (' + ', '.join(differences) + ')', dst)
-        os.utime(tmp, ns=(ds.st_atime_ns, ds.st_mtime_ns))
-        sync_file(tmp)
-        staged = signature(tmp.lstat())
-        journal.add(event='prepared', id=ident, signature=staged)
+        os.utime(work, ns=(ds.st_atime_ns, ds.st_mtime_ns))
+        sync_file(work)
+        sync_dir(work.parent)
+        staged = signature(work.lstat())
+        replacement = dict(signature=staged, metadata=fingerprint,
+                           generation=native.generation(work))
+        journal.add(event='prepared', id=ident, signature=staged,
+                    generation=replacement['generation'])
         return SimpleNamespace(ident=ident, dst=dst, tmp=tmp, relative=relative, fd=fd, digest=digest,
-                               expected=expected_dst, metadata=metadata, generation=generation, staged=staged)
+                               expected=expected_dst, metadata=metadata, generation=generation,
+                               staged=staged, replacement=replacement, directory=directory, work=work)
     except BaseException as e:
         if fd is not None:
             os.close(fd)
         if isinstance(e, (Skip, OSError)):
             # dst is untouched; tmp, if present, is the unpublished clone.
             if journaled:
-                discard_stage(journal, ident, tmp)
+                discard_stage(native, journal, ident, tmp, directory)
             if not isinstance(e, Skip):
                 raise Skip(e.strerror or str(e), e.filename or dst) from e
         # Journal recovery handles the staged file after other failures or interruption.
@@ -596,12 +653,13 @@ def publish(native, journal, batch, cache=None):
                     raise Skip('Changed during verification', item.dst)
                 if native.metadata(item.dst) != item.metadata or native.generation(item.dst) != item.generation:
                     raise Skip('Changed during verification', item.dst)
-                if signature(item.tmp.lstat()) != item.staged:
+                private_stage_directory(native, item.tmp.parent, item.directory)
+                if signature(item.work.lstat()) != item.staged:
                     raise Skip('Staged clone changed', item.tmp)
-                native.swap(item.tmp, item.dst)
+                native.swap(item.work, item.dst)
                 exchanged.append(item)
             except (Skip, OSError) as e:
-                discard_stage(journal, item.ident, item.tmp)
+                discard_stage(native, journal, item.ident, item.tmp, item.directory)
                 outcomes[item.ident] = e if isinstance(e, Skip) else Skip(e.strerror or str(e), item.dst)
         # item.dst now names the clone and item.tmp the original, still open as item.fd.
         busy = native.open_files(mappings=False)
@@ -610,8 +668,8 @@ def publish(native, journal, batch, cache=None):
                 if tuple(item.expected[:2]) in busy:
                     reverting.append((item, 'Opened by another process during replacement'))
                 elif (not unchanged(signature(os.fstat(item.fd)), item.expected)
-                      or native.generation(item.tmp) != item.generation
-                      or native.metadata(item.tmp) != item.metadata):
+                      or native.generation(item.work) != item.generation
+                      or native.metadata(item.work) != item.metadata):
                     reverting.append((item, 'Changed during replacement'))
             except OSError as e:
                 reverting.append((item, 'Replacement could not be confirmed (' + (e.strerror or str(e)) + ')'))
@@ -620,7 +678,9 @@ def publish(native, journal, batch, cache=None):
         for item, reason in reverting:
             try:
                 clone_open = tuple(item.staged[:2]) in busy or native.generation(item.dst) == 0
-                settle_swapped(item.tmp, item.dst, item.staged, clone_open, False)
+                settle_swapped(native, item.work, item.dst, item.replacement,
+                               clone_open, None, display=item.tmp)
+                remove_private_stage(native, item.tmp, item.directory)
             except Conflict as e:
                 journal.add(event='conflict', id=item.ident)
                 outcomes[item.ident] = Skip('Conflict; both versions kept', item.dst)
@@ -631,8 +691,11 @@ def publish(native, journal, batch, cache=None):
         for item in exchanged:
             if item.ident in outcomes:
                 continue
-            item.tmp.unlink()
             sync_dir(item.dst.parent)
+            sync_dir(item.work.parent)
+            item.work.unlink()
+            sync_dir(item.work.parent)
+            remove_private_stage(native, item.tmp, item.directory)
             current = lstat_or_none(item.dst)
             final = signature(current) if current else None
             if final is None or not unchanged(final, item.staged):
@@ -714,7 +777,7 @@ def directory_groups(root, groups, exclusions, journal_path):
                 items = sorted(it, key=lambda e: e.name)
             for entry in items:
                 path = Path(entry.path)
-                if entry.name in exclusions or entry.name.startswith(PREFIX) or path in blocked:
+                if entry.name in exclusions or entry.name.startswith(STAGING_PREFIXES) or path in blocked:
                     return None
                 s = entry.stat(follow_symlinks=False)
                 if stat.S_ISLNK(s.st_mode):
@@ -908,6 +971,8 @@ def print_summary(result, top):
         print(f'Estimated physical savings: ~{human_bytes(result["estimated_physical_bytes"])}.')
     if result['already_completed_files']:
         print(f'Already completed: {result["already_completed_files"]:,} files.')
+    if result['already_shared_files']:
+        print(f'Already sharing the keeper’s blocks: {result["already_shared_files"]:,} files.')
     if result['provenance_unmatched_files']:
         print(f'Preserved {len(result["provenance_unmatched_files"]):,} files with incompatible provenance.')
     if skipped:
@@ -945,7 +1010,8 @@ def scan(root, minimum, exclusions, journal_path, progress, native, skip):
         return s is not None and stat.S_ISDIR(s.st_mode) and s.st_dev == device
     for directory, dirs, files in os.walk(root, followlinks=False, onerror=walk_error):
         directories += 1
-        dirs[:] = sorted(n for n in dirs if n not in exclusions and descend(Path(directory) / n))
+        dirs[:] = sorted(n for n in dirs if n not in exclusions and not n.startswith(STAGING_PREFIXES)
+                         and descend(Path(directory) / n))
         for name in sorted(files):
             progress.checkpoint()
             seen += 1
@@ -961,6 +1027,12 @@ def scan(root, minimum, exclusions, journal_path, progress, native, skip):
             if not eligible(s) or s.st_size < minimum or s.st_dev != device:
                 skipped += 1
                 continue
+            if s.st_flags & COMPRESSED:
+                try:
+                    native.require_verified_compression_xattrs(path)
+                except OSError as error:
+                    skip(path, error)
+                    continue
             sizes[s.st_size].append(path)
             scanned += 1
         progress.emit(f'Scanning: {seen:,} files seen; {scanned:,} eligible; {directories:,} directories')
@@ -995,7 +1067,7 @@ def scan(root, minimum, exclusions, journal_path, progress, native, skip):
                 if cached is not None:
                     provenance = bytes.fromhex(cached['hex']) if cached['hex'] is not None else None
                 else:
-                    provenance = native.xattrs(path).get(PROVENANCE_XATTR)
+                    provenance = native.xattr(path, PROVENANCE_XATTR, XATTR_NOFOLLOW)
                 if signature(path.lstat()) != sig:
                     raise Skip('File changed after hashing', path)
             except (Skip, OSError) as e:
@@ -1184,11 +1256,11 @@ def main(argv=None):
         planned, tasks = [], []
         progress.start('Planning replacements', sum(len(paths) - 1 for _, paths in groups),
                        sum(key[0] * (len(paths) - 1) for key, paths in groups))
-        already = 0
+        already = already_shared = 0
         for (size, digest), files in groups:
             files = order_keeper(native, files, completed, root, skip)
-            for dst, ds in files[1:]:
-                src, ss = files[0]
+            for dst, ds, dst_id in files[1:]:
+                src, ss, src_id = files[0]
                 progress.current_path = str(dst)
                 progress.count += 1
                 progress.bytes += size
@@ -1197,7 +1269,14 @@ def main(argv=None):
                 if previous_exclusions.get(rel) == ds:
                     unmatched.append(rel)
                     continue
-                if completed.get(rel) == ds:
+                done = completed.get(rel) == ds
+                if src_id and src_id == dst_id:
+                    if done:
+                        already += 1
+                    else:
+                        already_shared += 1
+                    continue
+                if done and not (src_id and dst_id):
                     already += 1
                     continue
                 try:
@@ -1277,8 +1356,11 @@ def main(argv=None):
                   'provenance_unmatched_files': unmatched, 'skipped_files': skipped,
                   'logical_duplicate_bytes': sum(x['size_bytes'] for x in planned),
                   'estimated_physical_bytes': sum(x['estimated_physical_bytes'] for x in planned),
+                  'estimated_applied_physical_bytes': sum(x['estimated_physical_bytes'] for x in planned
+                                                          if x['destination'] in cloned),
                   'cloned_files': changed, 'cloned_logical_bytes': changed_bytes,
-                  'already_completed_files': already, 'changes': planned,
+                  'already_completed_files': already, 'already_shared_files': already_shared,
+                  'changes': planned,
                   'journal': str(jp),
                   'volume_free_change_bytes': free_bytes(root) - free_before,
                   'elapsed_seconds': round(time.monotonic() - start, 3)}

@@ -12,6 +12,7 @@ The scripts are standalone command-line tools.
 | Undo everything done to a directory, including ignored and untracked files | `apfs-checkpoint.py` | create 0.26 s, diff 0.4 s for 12,000 files |
 | What a file or tree really occupies when clones are involved | `apfs-inspect.py` | `du` reported 572 MiB for 381 MiB on disk |
 | Replace duplicate files with clones, safely, in a tree that is in use | `apfs-dedupe.py` | |
+| Preview or run transparent compression and deduplication together | `apfs-reclaim.py` | |
 | Copy a tree to another volume, verified and resumable, sharing duplicates at the destination | `apfs-transfer.py` | |
 | Compress cold files transparently (LZVN/LZFSE/zlib) with a plan, a budget and a state database | `apfs_compress_plus.py` | |
 | Make Claude Code's own worktrees (`--worktree`, subagent isolation) copy-on-write | `claude-worktree-hook.py` | |
@@ -78,9 +79,9 @@ python3 "$APFS_DEV"/scripts/apfs-checkpoint.py create "$PWD" -m baseline
 python3 "$APFS_DEV"/scripts/apfs-checkpoint.py diff "$PWD"
 python3 "$APFS_DEV"/scripts/apfs-checkpoint.py restore "$PWD" && cd "$PWD"
 
-# Duplicates and compression: both preview by default
-python3 "$APFS_DEV"/scripts/apfs-dedupe.py ~/code --top 10
-python3 "$APFS_DEV"/scripts/apfs_compress_plus.py file scan ~/Archive
+# Preview or run both operations using built-in macOS compression
+python3 "$APFS_DEV"/scripts/apfs-reclaim.py ~/code
+python3 "$APFS_DEV"/scripts/apfs-reclaim.py ~/code --apply
 ```
 
 Every script prints its manual with `--help`.

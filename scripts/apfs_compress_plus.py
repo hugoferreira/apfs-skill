@@ -25,7 +25,6 @@ import sqlite3
 import stat
 import subprocess
 import sys
-import tempfile
 import textwrap
 import threading
 import time
@@ -55,8 +54,11 @@ if sys.version_info < MIN_PYTHON:
     print("Suggestion: rerun with a newer python3", file=sys.stderr)
     sys.exit(EXIT_UNSUPPORTED)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from apfs_common import (DECMPFS_XATTR, XATTR_NOFOLLOW, Native, OpenUse,  # noqa: E402
-                         atomic_write, free_bytes, human_bytes)
+from apfs_common import (DECMPFS_XATTR, PROVENANCE_XATTR, STAGING_PREFIXES, UNSAFE_FLAGS, Conflict,  # noqa: E402
+                         XATTR_NOFOLLOW, Native, OpenUse, atomic_write,
+                         free_bytes, human_bytes, signature)
+from apfs_publish import (PUBLICATION_PREFIX, PublicationConflict, publication_directory,
+                          recover_publication, staged_replacement)
 
 logger = logging.getLogger(__name__)
 ATOMIC_TEMP_PREFIX = ".apfs-compress-plus-"
@@ -84,7 +86,7 @@ COVERAGE_BUCKETS = (("full", 1.0), ("10-100%", 0.1), ("1-10%", 0.01),
                     ("under 1%", 0.0))
 BACKENDS = ("afsctool", "applesauce", "ditto")
 DEFAULT_BACKEND = "afsctool"
-REPAIR_KINDS = ("lost_flag", "stale_image")
+REPAIR_KINDS = ("lost_flag", "stale_image", "interrupted_swap")
 # Extended attributes that prevent compression of an uncompressed file.
 BLOCKING_XATTRS = {
     "com.apple.ResourceFork": "a resource fork",
@@ -131,9 +133,10 @@ class CompressorRefusedError(RuntimeError):
             f"{path}: {message}" for path, message in self.failures.items()
         ))
 
-    def error_for_path(self, path: Path) -> RuntimeError:
+    def error_for_path(self, path: Path) -> Exception:
         cause = self.causes.get(str(path))
-        if isinstance(cause, (FileInUseError, NoSavingsError)):
+        if isinstance(cause, (FileInUseError, NoSavingsError, PublicationConflict, OSError,
+                              subprocess.CalledProcessError)):
             return cause
         message = self.failures.get(str(path), "compressor refused the file")
         return CompressorRefusedError({path: message})
@@ -174,10 +177,11 @@ def os_error_text(exc: OSError) -> str:
     return exc.strerror or str(exc)
 
 
-def run_command(command, *, check: bool = True):
+def run_command(command, *, check: bool = True, cwd=None):
     """Run a command with the standard contract: captured text output."""
+    location = {"cwd": cwd} if cwd is not None else {}
     return subprocess.run(
-        command, check=check, capture_output=True, text=True
+        command, check=check, capture_output=True, text=True, **location
     )
 
 
@@ -353,6 +357,7 @@ def write_repair(result: dict) -> None:
     print(f"{action}: {result['files_repaired']}")
     print_fields([("Flags restored", result["flags_restored"]),
                   ("Executables reseated", result["images_reseated"]),
+                  ("Publications recovered", result["publications_recovered"]),
                   ("Errors", result["errors"])])
     for failure in result["failures"]:
         print(f"  {failure['path']}: {failure['message']}")
@@ -522,6 +527,7 @@ def find_file_problems(roots: list[Path]) -> Iterator[tuple[str, Path]]:
         metadata. afsctool truncates such a file.
     leftover_copy: a temporary directory that stayed after an interrupted
         replacement.
+    interrupted_swap: a private directory holding a recoverable publication.
     unreadable: a directory that the tool cannot list.
     """
     def classify(path: Path, st: os.stat_result):
@@ -538,14 +544,22 @@ def find_file_problems(roots: list[Path]) -> Iterator[tuple[str, Path]]:
     while stack:
         current = stack.pop()
         try:
+            if current.name.startswith(PUBLICATION_PREFIX):
+                yield "interrupted_swap", current
+                continue
             if not current.is_dir() or current.is_symlink():
+                stage = publication_directory(current)
+                if stage.exists() or stage.is_symlink():
+                    yield "interrupted_swap", stage
                 yield from classify(current,
                                     current.stat(follow_symlinks=False))
                 continue
             with os.scandir(current) as scan:
                 for entry in scan:
                     if entry.is_dir(follow_symlinks=False):
-                        if entry.name.startswith(ATOMIC_TEMP_PREFIX):
+                        if entry.name.startswith(PUBLICATION_PREFIX):
+                            yield "interrupted_swap", Path(entry.path)
+                        elif entry.name.startswith(ATOMIC_TEMP_PREFIX):
                             yield "leftover_copy", Path(entry.path)
                         else:
                             stack.append(Path(entry.path))
@@ -894,21 +908,22 @@ def build_command_parser() -> AgentArgumentParser:
     repair = add_verb(
         file_verbs, "file", "repair",
         "repair compressed files left in a damaged state",
-        "Repair two kinds of damage at or below each PATH. lost_flag: a "
+        "Repair the following conditions at or below each PATH. lost_flag: a "
         "compressed file whose compressed flag is gone reads as zero bytes "
         "although its data is still attached; the flag is restored and the "
         "content read back, and the file is left as found if that fails. "
         "stale_image: an executable compressed in place after being run is "
         "killed on launch; executables recorded in the state database are "
-        "replaced by identical copies. Changes files and state; content is "
-        "never rewritten. 'system doctor PATH' reports what would be found.",
+        "replaced by identical copies. interrupted_swap: recover a journaled "
+        "compression publication and preserve both files if they conflict. "
+        "'system doctor PATH' reports what would be found.",
         "~/Development --dry-run", "~/Development --json",
-        "~/Development --only lost_flag",
+        "~/Development --only interrupted_swap",
     )
     repair.add_argument("paths", nargs="+", metavar="PATH",
                         help="Files or directories to repair")
     repair.add_argument("--only", choices=REPAIR_KINDS,
-                        help="Repair one kind of damage (default: both)")
+                        help="Repair one kind of damage (default: all)")
     repair.add_argument("--all-images", action="store_true",
                         help="Reseat every recorded compressed executable; "
                              "by default only those rewritten in place "
@@ -2088,20 +2103,41 @@ def require_unused(path: Path) -> None:
         raise FileInUseError(path, users)
 
 
-def replace_unchanged_source(temporary: Path, path: Path,
-                             original: os.stat_result) -> None:
-    """Atomically replace path if it is not open or changed after the copy."""
-    users = open_file_users(path)
-    if users:
-        raise FileInUseError(path, users)
-    current = path.stat(follow_symlinks=False)
-    if stat_identity(current) != stat_identity(original):
+def replace_unchanged_source(publication, original: os.stat_result) -> None:
+    """Verify the copy and keep the displaced inode until publication is checked."""
+    path, temporary = publication.path, publication.payload
+    fs = publication.native
+    expected = signature(original)
+    if signature(path.stat(follow_symlinks=False)) != expected:
         raise RuntimeError("source changed before atomic replacement")
     # ditto can make an unreadable copy of a file that has stale compression
     # metadata. Thus, read the full copy before it replaces the file.
     if not filecmp.cmp(temporary, path, shallow=False):
         raise RuntimeError("copy differs from the source")
-    temporary.replace(path)
+    users = open_file_users(path)
+    if users:
+        raise FileInUseError(path, users)
+    if signature(path.stat(follow_symlinks=False)) != expected:
+        raise RuntimeError("source changed before atomic replacement")
+    metadata = fs.metadata(path, nofollow=True)
+    copied = fs.metadata(temporary, nofollow=True)
+    if copied != metadata:
+        fs.restore(temporary, metadata, original.st_atime_ns)
+        copied = fs.metadata(temporary, nofollow=True)
+    if copied != metadata:
+        if copied[6].get(PROVENANCE_XATTR) != metadata[6].get(PROVENANCE_XATTR):
+            raise RuntimeError("macOS did not preserve com.apple.provenance")
+        raise RuntimeError("staged compression copy does not preserve source metadata")
+    publication.publish(expected)
+
+
+def require_settled_publication(stage: Path) -> None:
+    if os.path.lexists(stage):
+        raise AppError(
+            "publication_pending", f"Compression recovery stage exists: {stage}",
+            EXIT_CONFLICT, "run file repair --only interrupted_swap for the affected path",
+            path=str(stage),
+        )
 
 
 def is_mach_o(path: Path) -> bool:
@@ -2127,11 +2163,10 @@ def sibling_copy(path: Path, copy_command: list[str]):
         raise RuntimeError(
             "multiply-linked file cannot be replaced without breaking links"
         )
-    with tempfile.TemporaryDirectory(
-            prefix=ATOMIC_TEMP_PREFIX, dir=path.parent) as directory:
-        temporary = Path(directory, path.name)
-        run_command([*copy_command, str(path), str(temporary)])
-        yield temporary, original
+    with staged_replacement(native(), path) as publication:
+        run_command([*copy_command, str(path.absolute()), publication.payload.name],
+                    cwd=publication.payload.parent)
+        yield publication, original
 
 
 def uncompressed_sibling_copy(path: Path):
@@ -2144,10 +2179,10 @@ def reseat_file(path: Path) -> None:
     This clears the stale code-signature state of an executable image that
     was run and then written in place; see is_mach_o.
     """
-    with sibling_copy(path, ["ditto"]) as (temporary, original):
-        if not already_compressed(temporary):
+    with sibling_copy(path, ["ditto"]) as (publication, original):
+        if not already_compressed(publication.payload):
             raise RuntimeError("copy did not keep its compression")
-        replace_unchanged_source(temporary, path, original)
+        replace_unchanged_source(publication, original)
 
 
 def restore_compressed_flag(path: Path) -> None:
@@ -2244,19 +2279,29 @@ def repair_files(cache: StateCache, roots: list[Path], dry_run: bool,
     """
     records = []
     failures = []
-    restored = 0
-    if "lost_flag" in kinds:
+    restored = recovered = 0
+    seen = set()
+    if {"lost_flag", "interrupted_swap"}.intersection(kinds):
         for kind, path in find_file_problems(roots):
-            if kind != "lost_flag":
+            if kind not in ("lost_flag", "interrupted_swap") or kind not in kinds:
                 continue
-            record = {"path": str(path), "repair": "flag_restored"}
+            if path in seen:
+                continue
+            seen.add(path)
+            action = "publication_recovered" if kind == "interrupted_swap" else "flag_restored"
+            record = {"path": str(path), "repair": action}
             try:
-                if not dry_run:
-                    restore_compressed_flag(path)
+                if kind == "interrupted_swap":
+                    restored_path = recover_publication(native(), path, dry_run)
+                    record.update(path=str(restored_path), stage=str(path))
+                    recovered += 1
+                else:
+                    if not dry_run:
+                        restore_compressed_flag(path)
+                    restored += 1
                 records.append({**record, "status": ("planned" if dry_run
                                                      else "repaired")})
-                restored += 1
-            except (OSError, RuntimeError) as exc:
+            except (OSError, RuntimeError, Conflict, ValueError, TypeError, KeyError) as exc:
                 failures.append({
                     **record, "status": "error", "error": "repair_failed",
                     "message": str(exc), "retryable": False,
@@ -2276,9 +2321,10 @@ def repair_files(cache: StateCache, roots: list[Path], dry_run: bool,
     return {
         "dry_run": dry_run,
         "files": records + failures,
-        "files_repaired": restored + reseated,
+        "files_repaired": restored + reseated + recovered,
         "flags_restored": restored,
         "images_reseated": reseated,
+        "publications_recovered": recovered,
         "errors": len(failures),
         "failures": failures,
     }
@@ -2286,10 +2332,10 @@ def repair_files(cache: StateCache, roots: list[Path], dry_run: bool,
 
 def atomic_decompress_file(path: Path) -> None:
     """Replace path with an uncompressed copy on a new inode."""
-    with uncompressed_sibling_copy(path) as (temporary, original):
-        if already_compressed(temporary):
+    with uncompressed_sibling_copy(path) as (publication, original):
+        if already_compressed(publication.payload):
             raise RuntimeError("temporary copy remained compressed")
-        replace_unchanged_source(temporary, path, original)
+        replace_unchanged_source(publication, original)
 
 
 def declined(path: Path, diagnostics: list[str]) -> RuntimeError:
@@ -2308,28 +2354,49 @@ def declined(path: Path, diagnostics: list[str]) -> RuntimeError:
 
 def atomic_compress_file(path: Path, algo: str) -> None:
     """Compress a copy that keeps metadata, then atomically replace path."""
-    with uncompressed_sibling_copy(path) as (temporary, original):
-        process = run_command(afsctool_compress_command([temporary], algo))
+    with uncompressed_sibling_copy(path) as (publication, original):
+        temporary = publication.payload
+        process = run_command(afsctool_compress_command([temporary.name], algo),
+                              cwd=temporary.parent)
         if not already_compressed(temporary):
-            raise declined(temporary, process.stderr.splitlines())
+            raise declined(Path(temporary.name), process.stderr.splitlines())
         if allocated_size(temporary.stat()) >= allocated_size(original):
             raise NoSavingsError("compression saved no allocated bytes")
-        replace_unchanged_source(temporary, path, original)
+        replace_unchanged_source(publication, original)
 
 
-def ditto_compress_file(path: Path) -> None:
-    """Apply the built-in compression of ditto through a sibling copy."""
+def ditto_compress_file(path: Path) -> bool:
+    """Replace a file with a verified, smaller compressed sibling copy."""
+    fs = native()
     original = path.stat(follow_symlinks=False)
-    with tempfile.TemporaryDirectory(
-            prefix=ATOMIC_TEMP_PREFIX, dir=path.parent) as directory:
-        temporary = Path(directory, path.name)
-        command = [*BASE, str(path), str(temporary)]
-        process = run_command(command)
+    if (not stat.S_ISREG(original.st_mode) or original.st_nlink != 1
+            or original.st_flags & UNSAFE_FLAGS or original.st_mode & 0o6000):
+        raise RuntimeError("source is no longer eligible for atomic replacement")
+    original_sharing = fs.sharing(path)
+    if original_sharing.private == 0:
+        return False
+    with staged_replacement(fs, path) as publication:
+        temporary = publication.payload
+        command = [*BASE, str(path.absolute()), temporary.name]
+        process = run_command(command, cwd=temporary.parent)
         logger.debug("Ditto stdout: %s", process.stdout)
         logger.debug("Ditto stderr: %s", process.stderr)
-        if (already_compressed(temporary) and
-                allocated_size(temporary.stat()) < allocated_size(original)):
-            replace_unchanged_source(temporary, path, original)
+        if signature(path.stat(follow_symlinks=False)) != signature(original):
+            raise RuntimeError("source changed during staged compression")
+        if not already_compressed(temporary):
+            # Some macOS builds write the decmpfs image but leave UF_COMPRESSED
+            # unset. Recover only our staging file, then read it back in full.
+            if not fs.decmpfs(temporary):
+                return False
+            restore_compressed_flag(temporary)
+        private = fs.sharing(path).private
+        reclaimable = allocated_size(original)
+        if private is not None:
+            reclaimable = min(reclaimable, private)
+        if allocated_size(temporary.stat()) >= reclaimable:
+            return False
+        replace_unchanged_source(publication, original)
+        return True
 
 
 def run_compressor(paths, algo: str) -> set[Path]:
@@ -2348,14 +2415,16 @@ def run_compressor(paths, algo: str) -> set[Path]:
             )
     paths = [path for path in paths if path not in failures]
     if TOOL == "ditto":
+        replaced = set()
         for path in paths:
             try:
-                ditto_compress_file(path)
-            except RuntimeError as exc:
+                if ditto_compress_file(path):
+                    replaced.add(path)
+            except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
                 failures[path] = exc
         if failures:
-            raise CompressorRefusedError(failures)
-        return set()
+            raise CompressorRefusedError(failures, replaced)
+        return replaced
 
     # The tool does not write executable images in place; see is_mach_o. It
     # writes other files in place if no other process can write them.
@@ -2438,6 +2507,7 @@ class Stats:
     skipped_cached: int = 0
     skipped_ratio: int = 0
     skipped_already: int = 0
+    skipped_shared: int = 0
     skipped_too_new: int = 0
     skipped_too_small: int = 0
     skipped_excluded_ext: int = 0
@@ -2874,6 +2944,8 @@ def scanner(args, roots: list[Path], q: queue.Queue[QueueItem], stats: Stats,
     while stack and not stop.is_set():
         root, root_index = stack.pop()
         if root.is_file():
+            if not getattr(args, "dry_run", True):
+                require_settled_publication(publication_directory(root))
             entries = [root]
         else:
             try:
@@ -2884,9 +2956,11 @@ def scanner(args, roots: list[Path], q: queue.Queue[QueueItem], stats: Stats,
                             with lock:
                                 stats.skipped_excluded += 1
                         elif entry.is_dir(follow_symlinks=False):
+                            if (not getattr(args, "dry_run", True)
+                                    and entry.name.startswith(PUBLICATION_PREFIX)):
+                                require_settled_publication(Path(entry.path))
                             if (entry.name not in ex_dirs and
-                                    not entry.name.startswith(
-                                        ATOMIC_TEMP_PREFIX)):
+                                    not entry.name.startswith(STAGING_PREFIXES)):
                                 stack.append((Path(entry.path), root_index))
                         elif entry.is_file(follow_symlinks=False):
                             entries.append(Path(entry.path))
@@ -3125,6 +3199,10 @@ class FileTask:
                 self.skip("skipped_recompress_unknown",
                           "recompress_codec_unknown")
                 return True
+        if (TOOL == "ditto" and not self.was_compressed
+                and native().sharing(self.path).private == 0):
+            self.skip("skipped_shared", "all_blocks_shared")
+            return True
         return False
 
     def check_budget(self) -> bool:
@@ -3416,10 +3494,18 @@ class FileTask:
                 True, in_use=True, open_processes=e.users,
                 suggestion="close the listed process and retry",
             )
+        except PublicationConflict as e:
+            with self.context.lock:
+                self.context.stats.conflicts += 1
+            self.report_failure(
+                "publication_conflict", str(e), False,
+                suggestion="inspect the stage with file repair --only interrupted_swap --dry-run",
+            )
         except CompressorRefusedError as e:
             self.report_failure(
                 "compressor_refused",
-                "compressor refused both in-place and atomic-copy attempts",
+                ("staged copy did not pass verification" if TOOL == "ditto"
+                 else "compressor refused both in-place and atomic-copy attempts"),
                 False, detail=e.failures.get(str(self.path)),
                 suggestion=("check that the directory permits temporary files "
                             "and atomic replacement"),
@@ -3681,17 +3767,21 @@ def doctor_checks(state_db: Path, roots: list[Path]) -> list[dict]:
                        **fields})
 
     afsctool = shutil.which("afsctool")
+    ditto_without_clone = ditto_clone_flag()
     if afsctool:
         usage = run_command([afsctool], check=False)
         version = re.search(r"afsctool (\d[\d.]*\d)",
                             usage.stdout + usage.stderr)
         report("backend", "ok",
                f"afsctool {version.group(1) if version else ''} at {afsctool}")
+    elif ditto_without_clone:
+        report("backend", "ok", "ditto is available for built-in LZVN compression",
+               suggestion="use --backend ditto or apfs-reclaim.py")
     else:
         report("backend", "problem", "afsctool is not installed",
                suggestion="install afsctool, or pass --backend ditto to "
                           "file compress")
-    if ditto_clone_flag():
+    if ditto_without_clone:
         report("copy_tool", "ok", "ditto can copy without cloning")
     else:
         report("copy_tool", "warning",
@@ -3787,7 +3877,11 @@ def doctor_checks(state_db: Path, roots: list[Path]) -> list[dict]:
             ("leftover_copy", "warning", "temporary directory",
              "left by an interrupted run",
              "no temporary directories remain",
-             "delete them; the originals were not replaced"),
+             "inspect these legacy temporary copies"),
+            ("interrupted_swap", "problem", "private staging directory",
+             "has a pending compression publication",
+             "no compression publication needs recovery",
+             f"{program} file repair {target} --only interrupted_swap"),
             ("unreadable", "warning", "directory",
              "could not be read and were not checked",
              "every directory was readable", None)):
@@ -3854,6 +3948,9 @@ def file_inspect(args: argparse.Namespace, mode: str) -> int:
 def file_decompress(args: argparse.Namespace, mode: str) -> int:
     paths = [resolve_existing(path) for path in args.paths]
     require_confirmation(args)
+    if not args.dry_run:
+        for path in paths:
+            require_settled_publication(publication_directory(path))
     validate_target_filesystems(paths)
     select_backend("afsctool", required=not args.dry_run)
     result = decompress_files(paths, args.dry_run, args.yes)
@@ -3905,6 +4002,7 @@ def compression_summary(args: argparse.Namespace, stats: Stats,
         skipped_cached=stats.skipped_cached,
         skipped_ratio=stats.skipped_ratio,
         skipped_already=stats.skipped_already,
+        skipped_shared=stats.skipped_shared,
         skipped_too_new=stats.skipped_too_new,
         skipped_too_small=stats.skipped_too_small,
         skipped_excluded_ext=stats.skipped_excluded_ext,
@@ -3957,7 +4055,6 @@ def compression_summary(args: argparse.Namespace, stats: Stats,
 
 def file_compress(args: argparse.Namespace, mode: str) -> int:
     """Run 'file scan' or 'file compress'."""
-    select_backend(args.backend, required=not args.dry_run, selectable=True)
     plan = load_plan(Path(args.from_plan)) if args.from_plan else None
     args.plan_records = plan["records"] if plan else {}
     roots = ([Path(path) for path in args.plan_records]
@@ -3967,6 +4064,10 @@ def file_compress(args: argparse.Namespace, mode: str) -> int:
             "empty_plan", "compression plan contains no files", EXIT_USAGE,
             "create a plan with at least one eligible file",
         )
+    if plan and not args.dry_run:
+        for path in roots:
+            require_settled_publication(publication_directory(path))
+    select_backend(args.backend, required=not args.dry_run, selectable=True)
     volumes = [
         {"mountpoint": info["mountpoint"], "device": info["device"],
          "path": info["path"], "free_bytes_before": free_bytes(info["path"])}

@@ -7,12 +7,14 @@ import os
 from pathlib import Path
 import signal
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from unittest import mock
+import zlib
 
 HERE = Path(__file__).resolve().parent
 
@@ -69,6 +71,22 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.cli('--apply')['resumed_files'], 2)
         (self.dest / 'b').write_bytes(b'independent')
         self.assertEqual((self.dest / 'a').read_bytes(), (self.source / 'a').read_bytes())
+
+    def test_transfer_refuses_an_unverified_hidden_resource_fork(self):
+        path = self.source / 'compressed'
+        content = b'inline compression' * 200
+        fork = b'independent data in the resource fork'
+        path.touch()
+        image = struct.pack('<IIQ', 0x636d7066, 3, len(content)) + zlib.compress(content)
+        self.native.set_xattr(path, c.DECMPFS_XATTR, image)
+        self.native.set_xattr(path, c.RESOURCE_FORK_XATTR, fork)
+        os.chflags(path, c.UF_COMPRESSED)
+
+        result = self.cli('--apply', code=1)
+        self.assertIn('unverified hidden xattrs', result['message'])
+        self.assertFalse((self.dest / path.name).exists())
+        self.assertEqual(path.read_bytes(), content)
+        self.assertEqual(self.native.xattr(path, c.RESOURCE_FORK_XATTR, c.XATTR_SHOWCOMPRESSION), fork)
 
     def test_transfer_nested_symlinks_and_directory_metadata(self):
         sub = self.source / 'nested'
@@ -293,6 +311,56 @@ finally:
         self.assertFalse(list(self.dest.glob(t.PREFIX + '*')))
         self.assertEqual((self.source / 'a').read_bytes(), (self.dest / 'a').read_bytes())
 
+    def test_transfer_rejects_destination_created_at_publication(self):
+        name = 'a'
+        (self.source / name).write_bytes(b'copy')
+        destination = self.dest / name
+        args = type('Args', (), dict(apply=True, quiet=True, exclude=[], exclude_system=False,
+                                     replace=False, verify_all=False))()
+        rename = c.Native.rename_exclusive
+
+        def publish(native, stage, path):
+            path.write_bytes(b'created by another writer')
+            rename(native, stage, path)
+
+        with mock.patch.object(c.Native, 'rename_exclusive', publish), \
+             self.assertRaisesRegex(c.Conflict, 'Destination appeared'):
+            t.run(args, self.source, self.dest, self.state)
+        self.assertEqual(destination.read_bytes(), b'created by another writer')
+        self.assertIn('Destination exists', self.cli('--apply', code=1)['message'])
+        self.assertFalse(list(self.dest.glob(t.PREFIX + '*')))
+        self.assertEqual(destination.read_bytes(), b'created by another writer')
+
+    def test_copy_and_clone_stage_remove_inherited_acl(self):
+        self.pair()
+        self.dest.chmod(0o777)
+        subprocess.run(['/bin/chmod', '+a', 'everyone allow list,search,directory_inherit',
+                        str(self.dest)], check=True)
+        args = type('Args', (), dict(apply=True, quiet=True, exclude=[], exclude_system=False,
+                                     replace=False, verify_all=False))()
+        real_copy = t.copyfile
+        real_clone = c.Native.clone
+        observed = []
+
+        def check_stage(native, payload):
+            self.assertEqual(payload.parent.lstat().st_mode & 0o777, 0o700)
+            self.assertEqual(native.acl(payload.parent), c.EMPTY_ACL)
+            observed.append(payload)
+
+        def copy(native, source, payload, **kwargs):
+            if Path(payload).name == c.STAGE_PAYLOAD:
+                check_stage(native, payload)
+            real_copy(native, source, payload, **kwargs)
+
+        def clone(native, source, payload):
+            check_stage(native, payload)
+            real_clone(native, source, payload)
+
+        with mock.patch.object(t, 'copyfile', copy), mock.patch.object(c.Native, 'clone', clone):
+            self.assertEqual(t.run(args, self.source, self.dest, self.state)['cloned_files'], 1)
+        self.assertEqual(len(observed), 2)
+        self.assertFalse(list(self.dest.glob(t.PREFIX + '*')))
+
     def test_physical_copy_callback_reports_bytes(self):
         src, dst = self.source / 'a', self.dest / 'staged'
         src.write_bytes(os.urandom(3 * 1024 * 1024))
@@ -370,9 +438,11 @@ finally:
     def test_switching_journals_invalidates_the_shared_index(self):
         self.pair()
         one, two = self.root / 'one.gz', self.root / 'two.gz'
-        for journal in (one, two, one):
+        for journal, expected in ((one, (1, 0, 0)), (two, (0, 0, 1)), (one, (0, 1, 0))):
             result = self.cli('--apply', '--journal', str(journal), script='apfs-dedupe.py')
-            self.assertEqual(result['cloned_files'], 1)
+            counts = tuple(result[key] for key in ('cloned_files', 'already_completed_files',
+                                                    'already_shared_files'))
+            self.assertEqual(counts, expected)
 
 
 PREFIX = t.PREFIX

@@ -9,6 +9,14 @@ The scripts live in `scripts/` beside this `SKILL.md`. Resolve their paths from 
 
 Every script prints its manual with `--help`. Use Python 3.9 or later for the standard-library scripts, and Python 3.12 or later for `apfs_compress_plus.py`. Its available backends are described in [dedup-compression.md](references/dedup-compression.md). Measurements were taken on macOS 27.2.1 with Apple silicon and an internal SSD on 2026-11-22.
 
+## Deduplicate and compress a directory
+
+```bash
+python3 "$APFS_DEV"/scripts/apfs-reclaim.py "$PWD" --apply
+```
+
+Use `--apply` when the user asks to run both operations. For an estimate, omit `--apply`. The command finds Python 3.12+ when an older SDK Python is first on PATH, uses macOS `ditto`, compresses eligible cold files, then deduplicates by cloning the smallest compatible copy. It reports estimated APFS allocation before and after, identifies any pre-existing missing compression flags, and prints a state path to reuse if interrupted. Use [dedup-compression.md](references/dedup-compression.md) for tuning, separate operations, and interpreting skips.
+
 ## First checks
 
 ```bash
@@ -33,12 +41,13 @@ python3 "$APFS_DEV"/scripts/apfs-inspect.py --volume .             # fstype, clo
 | Checkpoint a directory before a risky step, restore later | `apfs-checkpoint.py create/diff/restore/drop DIR` | [snapshots.md](references/snapshots.md) |
 | Whole-volume point-in-time | `tmutil localsnapshot` (no restore API without entitlements) | [snapshots.md](references/snapshots.md) |
 | Find out what a file or tree really occupies | `apfs-inspect.py FILE...` / `--tree DIR` / `--families DIR` | [space.md](references/space.md) |
-| Reclaim space from duplicate files | `apfs-dedupe.py ROOT` (dry run) then `--apply` | [dedup-compression.md](references/dedup-compression.md), [apfs-tools.md](references/apfs-tools.md) |
+| Reclaim space from duplicate files | `apfs-dedupe.py ROOT` previews, `--apply` scans and replaces | [dedup-compression.md](references/dedup-compression.md), [apfs-tools.md](references/apfs-tools.md) |
 | Copy a tree to another volume, sharing duplicates at the destination | `apfs-transfer.py SRC DEST` | [apfs-tools.md](references/apfs-tools.md) |
-| Shrink cold, compressible files transparently | `apfs_compress_plus.py file scan/compress` or `afsctool -c` | [dedup-compression.md](references/dedup-compression.md) |
+| Shrink cold, compressible files transparently | `apfs_compress_plus.py file scan ROOT --backend ditto` previews, `file compress` applies | [dedup-compression.md](references/dedup-compression.md) |
 | Case-sensitive or size-capped scratch area | `diskutil apfs addVolume` on a sparse image, `-quota` | [volumes-images.md](references/volumes-images.md) |
 | Disposable environment that resets | sparse image + `hdiutil attach -shadow` | [volumes-images.md](references/volumes-images.md) |
 | Keep build output out of Time Machine / Spotlight | `tmutil addexclusion DIR`, `.noindex` suffix | [space.md](references/space.md) |
+| Compress and deduplicate a tree in one run | `apfs-reclaim.py ROOT --apply` | [dedup-compression.md](references/dedup-compression.md) |
 
 ## Rules
 
@@ -53,7 +62,7 @@ python3 "$APFS_DEV"/scripts/apfs-inspect.py --volume .             # fstype, clo
 9. **Snapshots need privileges.** Creating, mounting, or reverting APFS snapshots requires root and, for arbitrary volumes or revert, Apple-granted entitlements (`fs_snapshot_create: Operation not permitted` as a user, even on a user-attached disk image). Use clone checkpoints for per-directory undo.
 10. **A restore replaces the directory inode.** After `apfs-checkpoint.py restore DIR`, any process whose cwd or open files are inside DIR (including the shell that ran the restore from inside DIR) still refers to the swapped-out tree. Run restore from outside DIR or `cd` to DIR's absolute path again; restart dev servers and watchers.
 11. **Never clone `.git` or a linked worktree by hand.** A cloned `.git` directory is a second repository; a cloned linked worktree shares one index with its original. Use `apfs-worktree.py`, which registers a real worktree and skips other worktrees and nested linked checkouts.
-12. **Ask before destructive or global actions**: `--apply` of dedupe/compression on user trees, deleting snapshots, adding/deleting volumes on the internal disk, `git config` changes in the user's repo (`--fast-index` sets `extensions.worktreeConfig=true`), editing `settings.json` to install the worktree hook.
+12. **Check the authorized scope.** A request to run deduplication or compression on a named tree authorizes applying it there. A request to inspect or estimate calls for a preview. Confirm before deleting snapshots, changing volumes on the internal disk, or changing the user's Git config or hook settings unless the user already authorized that change.
 
 ## Common commands
 
@@ -89,9 +98,8 @@ python3 "$APFS_DEV"/scripts/apfs-inspect.py --families some/dir
 ```
 
 ```bash
-# dedupe / compression (dry runs by default)
-python3 "$APFS_DEV"/scripts/apfs-dedupe.py ~/Development --top 10
-python3 "$APFS_DEV"/scripts/apfs_compress_plus.py file scan ~/Archive
+# preview dedupe and compression
+python3 "$APFS_DEV"/scripts/apfs-reclaim.py ~/Development --json
 ```
 
 ## Symptoms
@@ -120,10 +128,12 @@ python3 "$APFS_DEV"/scripts/apfs_compress_plus.py file scan ~/Archive
 | File | Role |
 |---|---|
 | `apfs_common.py` | Shared module: the only libSystem bindings (clonefile, copyfile, renamex_np, getattrlist, statfs, xattr, ACL, libproc), signatures, hashing, atomic writes, tree removal, byte formatting. Every script imports it. |
+| `apfs_publish.py` | Journaled compression publication and recovery. |
 | `apfs_job.py` | Job state for long runs: lock, status, pause/resume/stop, checkpoints, progress. Used by dedupe and transfer. |
 | `apfs-inspect.py`, `apfs-worktree.py`, `apfs-checkpoint.py`, `claude-worktree-hook.py` | Written for this skill. |
 | `apfs-dedupe.py` (1.7.0), `apfs-transfer.py` | Started as standalone tools; refactored onto `apfs_common.py` and hardened in this skill. Manual: [apfs-tools.md](references/apfs-tools.md). |
 | `apfs_compress_plus.py` (0.5.0) | Started as a standalone tool (0.4.0); same treatment. Tests: `tests/compress/`. |
+| `apfs-reclaim.py` | Runs inspection, staged compression, and deduplication with one invocation. |
 
 Keep the scripts in one directory; they import each other by path.
 

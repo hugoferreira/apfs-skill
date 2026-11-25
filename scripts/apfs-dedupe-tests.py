@@ -20,6 +20,7 @@ SCRIPT = Path(__file__).with_name('apfs-dedupe.py')
 spec = importlib.util.spec_from_file_location('dedupe', SCRIPT)
 d = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(d)
+from apfs_common import XATTR_SHOWCOMPRESSION
 
 class Tests(unittest.TestCase):
     def setUp(self):
@@ -246,7 +247,9 @@ class Tests(unittest.TestCase):
         a,b,j,item=self.staged();real=d.Native.swap;children=[]
         def swap(native,x,y):
             # Opened after the first snapshot, immediately before the exchange.
-            children.append(self.holder(y));real(native,x,y)
+            if Path(y).stat().st_ino == item.expected[1]:
+                children.append(self.holder(y))
+            real(native,x,y)
         with mock.patch.object(d.Native,'swap',swap):
             (_,outcome),=d.publish(self.native,j,[item])[0]
         child,=children
@@ -256,8 +259,10 @@ class Tests(unittest.TestCase):
     def test_write_during_replacement_restores_original(self):
         a,b,j,item=self.staged();real=d.Native.swap
         def swap(native,x,y):
+            publishing = Path(y).stat().st_ino == item.expected[1]
             real(native,x,y)
-            with open(x,'ab') as f:f.write(b'late')
+            if publishing:
+                with open(x,'ab') as f:f.write(b'late')
         with mock.patch.object(d.Native,'swap',swap):
             (_,outcome),=d.publish(self.native,j,[item])[0]
         self.assert_original_kept(b,item,outcome,'Changed during replacement')
@@ -316,6 +321,50 @@ class Tests(unittest.TestCase):
         item.tmp.unlink()
         self.assertEqual(self.run_cli('--apply')['cloned_files'],0)
         self.assertEqual(b.read_bytes(),b'newer')
+
+    def test_recovery_preserves_xattr_edits_on_both_inodes(self):
+        a, b, item = self.exchanged()
+        key = b'org.example.concurrent-edit'
+        self.native.set_xattr(item.tmp, key, b'original edit')
+        self.native.set_xattr(b, key, b'replacement edit')
+        result = self.run_cli('--apply', code=1)
+        self.assertIn('both are kept', result['message'])
+        self.assertEqual(self.native.xattr(item.tmp, key), b'original edit')
+        self.assertEqual(self.native.xattr(b, key), b'replacement edit')
+
+    def test_rollback_keeps_xattr_written_to_replacement_during_exchange(self):
+        a, b, journal, item = self.staged()
+        real_swap = d.Native.swap
+        key = b'org.example.concurrent-edit'
+
+        def swap(native, work, target):
+            if Path(target).stat().st_ino == item.expected[1]:
+                native.set_xattr(target, key, b'original edit')
+            else:
+                native.set_xattr(target, key, b'replacement edit during rollback')
+            real_swap(native, work, target)
+
+        with mock.patch.object(d.Native, 'swap', swap), self.assertRaises(d.Conflict):
+            d.publish(self.native, journal, [item])
+        self.assertEqual(self.native.xattr(b, key), b'original edit')
+        self.assertEqual(self.native.xattr(item.tmp, key), b'replacement edit during rollback')
+
+    def test_stage_clears_inherited_access_before_clone(self):
+        self.root.chmod(0o777)
+        subprocess.run(['/bin/chmod', '+a', 'everyone allow list,search,directory_inherit',
+                        str(self.root)], check=True)
+        real_clone = d.Native.clone
+
+        def clone(native, source, payload):
+            self.assertEqual(payload.parent.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(native.acl(payload.parent), b'!#acl 1\n')
+            real_clone(native, source, payload)
+
+        with mock.patch.object(d.Native, 'clone', clone):
+            _, _, journal, item = self.staged()
+            self.assertEqual(item.tmp.parent.stat().st_mode & 0o777, 0o700)
+            d.publish(self.native, journal, [item])
+        self.assertFalse(item.tmp.parent.exists())
     def test_changing_and_vanishing_files_are_skipped(self):
         a,b=self.pair();c=self.root/'c';c.write_bytes(a.read_bytes());e=self.root/'e';e.write_bytes(a.read_bytes())
         real=d.hash_fd
@@ -353,7 +402,7 @@ class Tests(unittest.TestCase):
         original=d.Native.metadata
         def metadata(native,path):
             value=original(native,path)
-            if path.name.startswith(d.PREFIX):
+            if path.name == d.STAGE_PAYLOAD:
                 attrs=dict(value[6]);attrs[b'com.apple.provenance']=b'generated'
                 value=(*value[:6],attrs,value[7])
             return value
@@ -373,9 +422,10 @@ class Tests(unittest.TestCase):
     def test_incompatible_provenance_excluded_from_plan(self):
         a,b=self.pair();(self.root/'c').write_bytes(a.read_bytes())
         output=io.StringIO()
-        def attrs(native,path):
-            return {b'com.apple.provenance': b'original' if path.name=='a' else b'other'}
-        with mock.patch.object(d.Native,'xattrs',attrs),contextlib.redirect_stdout(output):
+        def provenance(native, path, name, options):
+            self.assertEqual((name, options), (d.PROVENANCE_XATTR, d.XATTR_NOFOLLOW))
+            return b'original' if path.name=='a' else b'other'
+        with mock.patch.object(d.Native,'xattr',provenance),contextlib.redirect_stdout(output):
             result=d.main([str(self.root),'--state-dir',str(self.state),'--json','--quiet'])
         self.assertEqual(result,0)
         result=json.loads(output.getvalue())
@@ -513,6 +563,9 @@ class Tests(unittest.TestCase):
         a=self.root/'a';a.write_bytes(b'compressible line of text\n'*80000)
         b=self.root/'b'
         subprocess.run(['/usr/bin/ditto','--noclone','--hfsCompression',str(a),str(b)],check=True)
+        if not b.stat().st_flags & d.COMPRESSED:
+            self.assertEqual(self.native.decmpfs(b)[1],a.stat().st_size)
+            os.chflags(b,b.stat().st_flags | d.COMPRESSED)
         self.assertTrue(b.stat().st_flags & d.COMPRESSED,'ditto did not compress fixture')
         self.assertLess(b.stat().st_blocks,a.stat().st_blocks)
         preview=self.run_cli('--top','1')
@@ -548,9 +601,27 @@ class Tests(unittest.TestCase):
         # b and c are one clone family: keep b, so only a's private blocks are counted.
         result=self.run_cli()
         self.assertEqual([(x['source'],x['destination'],x['estimated_physical_bytes']) for x in result['changes']],
-                         [('b','a',a.stat().st_blocks*512),('b','c',0)])
-        self.assertEqual(self.run_cli('--apply')['cloned_files'],2)
+                         [('b','a',a.stat().st_blocks*512)])
+        self.assertEqual(result['already_shared_files'],1)
+        c_inode=c.stat().st_ino
+        self.assertEqual(self.run_cli('--apply')['cloned_files'],1)
+        self.assertEqual(c.stat().st_ino,c_inode)
         self.assertEqual(self.native.sharing(a)[1],self.native.sharing(b)[1])
+    def test_smaller_keeper_can_replace_a_previously_completed_clone(self):
+        content=b'repeatable content for APFS compression\n'*50_000
+        a,b,c=(self.root/name for name in ('a','b','c'))
+        a.write_bytes(content)
+        b.write_bytes(content)
+        self.assertEqual(self.run_cli('--apply')['cloned_files'],1)
+        subprocess.run(['/usr/bin/ditto','--noclone','--hfsCompression',str(a),str(c)],check=True)
+        if not c.stat().st_flags & d.COMPRESSED:
+            self.assertEqual(self.native.decmpfs(c)[1],len(content))
+            os.chflags(c,c.stat().st_flags | d.COMPRESSED)
+        self.assertEqual(self.run_cli('--apply')['cloned_files'],2)
+        keeper_id=self.native.sharing(c).clone_id
+        for replaced in (a,b):
+            self.assertEqual(replaced.read_bytes(),content)
+            self.assertEqual(self.native.sharing(replaced).clone_id,keeper_id)
     def test_compressed_source(self):
         a,b=self.pair()
         # A decmpfs type-3 inline zlib stream, including the native header.
@@ -565,5 +636,28 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.native.metadata(b),before)
         self.assertEqual(a.read_bytes(),b.read_bytes())
         self.assertTrue(b.stat().st_flags & d.COMPRESSED)
+
+    def test_inline_compression_preserves_an_independent_hidden_resource_fork(self):
+        content = b'logically identical data' * 100
+        header = struct.pack('<IIQ', 0x636d7066, 3, len(content))
+        fork = b'independent resource fork' * 1600
+        a, b = self.root / 'a', self.root / 'b'
+        for path in (a, b):
+            path.touch()
+            self.native.set_xattr(path, 'com.apple.decmpfs', header + zlib.compress(content))
+        self.native.set_xattr(b, 'com.apple.ResourceFork', fork)
+        for path in (a, b):
+            os.chflags(path, d.COMPRESSED)
+        self.assertEqual(b.read_bytes(), content)
+        self.assertNotIn(b'com.apple.ResourceFork', self.native.xattr_names(b))
+        original_inode = b.stat().st_ino
+        result = self.run_cli('--apply')
+        self.assertEqual(result['cloned_files'], 0)
+        self.assertEqual(b.stat().st_ino, original_inode)
+        self.assertEqual(self.native.xattr(b, 'com.apple.ResourceFork', XATTR_SHOWCOMPRESSION), fork)
+        self.assertEqual(result['skipped_files'], [{
+            'path': 'b',
+            'reason': 'Compressed file has unverified hidden xattrs (com.apple.ResourceFork)',
+        }])
 
 if __name__=='__main__':unittest.main(verbosity=2)

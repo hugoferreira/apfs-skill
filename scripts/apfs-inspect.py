@@ -45,7 +45,8 @@ from apfs_common import (EF_IS_PURGEABLE, EF_IS_SPARSE, EF_MAY_SHARE_BLOCKS, EF_
 
 EXT = {EF_MAY_SHARE_BLOCKS: 'may_share_blocks', EF_IS_PURGEABLE: 'purgeable',
        EF_IS_SPARSE: 'sparse', EF_SHARES_ALL_BLOCKS: 'shares_all_blocks'}
-COUNTS = ('root', 'files', 'compressed_files', 'clone_shared_files', 'hardlinked_extra', 'unreadable')
+COUNTS = ('root', 'files', 'compressed_files', 'missing_compression_flag_files',
+          'clone_shared_files', 'hardlinked_extra', 'unreadable')
 native = Native()
 
 
@@ -101,7 +102,8 @@ def require_dir(root):
 def tree_report(root):
     require_dir(root)
     t = dict(root=str(root), files=0, logical=0, allocated=0, private=0,
-             compressed_files=0, compressed_allocated=0, clone_shared_files=0,
+             compressed_files=0, compressed_allocated=0, missing_compression_flag_files=0,
+             clone_shared_files=0,
              hardlinked_extra=0, unreadable=0, estimated_physical=0)
     family_shared = {}
     seen_inodes = set()
@@ -127,6 +129,10 @@ def tree_report(root):
             cid = r['clone_id'] or ('inode', key)
             family_shared[cid] = max(family_shared.get(cid, 0), r['allocated'])
             continue
+        if r['logical'] == 0:
+            header = native.decmpfs(p)
+            if header is not None and header[1] > 0:
+                t['missing_compression_flag_files'] += 1
         priv = r['private'] if r['private'] is not None else r['allocated']
         t['private'] += priv
         shared = max(r['allocated'] - priv, 0)

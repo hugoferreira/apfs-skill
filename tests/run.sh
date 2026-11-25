@@ -201,6 +201,7 @@ if [ "${1:-}" = "--all" ]; then
   $PY "$K/apfs-tools-tests.py"
   if $PY -c 'import sys; sys.exit(sys.version_info < (3, 12))'; then
     (cd "$(dirname "$0")/compress" && $PY -m unittest test_core test_cli)
+    $PY "$(dirname "$0")/test_reclaim.py"
   else
     echo "skipped - apfs_compress_plus.py tests need Python 3.12+"
   fi

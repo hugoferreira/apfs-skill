@@ -26,11 +26,12 @@ import uuid
 # <sys/stat.h> st_flags
 UF_IMMUTABLE, UF_APPEND, UF_COMPRESSED, SF_DATALESS = 0x2, 0x4, 0x20, 0x40000000
 # Immutable, append-only, nounlink, restricted, datavault and system variants.
-UNSAFE_FLAGS = 0x2 | 0x4 | 0x10 | 0x80 | 0x10000 | 0x20000 | 0x40000 | 0x100000
+UNSAFE_FLAGS = 0x2 | 0x4 | 0x10 | 0x80 | 0x10000 | 0x20000 | 0x40000 | 0x80000 | 0x100000
 # <sys/stat.h> extended flags from ATTR_CMNEXT_EXT_FLAGS
 EF_MAY_SHARE_BLOCKS, EF_IS_PURGEABLE, EF_IS_SPARSE, EF_SHARES_ALL_BLOCKS = 0x1, 0x8, 0x10, 0x40
 # <sys/clonefile.h>, <stdio.h> renamex_np
 CLONE_NOFOLLOW, CLONE_NOOWNERCOPY, RENAME_SWAP = 0x1, 0x2, 0x2
+RENAME_EXCL = 0x4
 # <sys/xattr.h>
 XATTR_NOFOLLOW, XATTR_SHOWCOMPRESSION = 0x1, 0x20
 # <sys/attr.h>
@@ -49,10 +50,15 @@ COPYFILE_STATE_STATUS_CB, COPYFILE_STATE_COPIED = 6, 8
 COPYFILE_COPY_DATA, COPYFILE_ERR, COPYFILE_PROGRESS, COPYFILE_QUIT = 4, 3, 4, 2
 # <sys/acl.h>
 ACL_TYPE_EXTENDED = 0x100
+EMPTY_ACL = b'!#acl 1\n'
+STAGE_PAYLOAD = 'payload'
+STAGING_PREFIXES = ('.apfs-dedupe-stage-', '.apfs-transfer-stage-', '.apfs-compress-plus-')
 # decmpfs: transparent compression metadata. Odd/even pairs are the same codec with the
 # payload in the xattr or in the resource fork.
 DECMPFS_XATTR, DECMPFS_MAGIC = 'com.apple.decmpfs', b'fpmc'
 DECMPFS_CODECS = {3: 'zlib', 4: 'zlib', 7: 'lzvn', 8: 'lzvn', 11: 'lzfse', 12: 'lzfse'}
+DECMPFS_RESOURCE_FORK_TYPES = frozenset({4, 8, 12})
+RESOURCE_FORK_XATTR = b'com.apple.ResourceFork'
 PROVENANCE_XATTR = b'com.apple.provenance'
 BACKUP_EXCLUDE_XATTR = 'com.apple.metadata:com_apple_backup_excludeItem'
 
@@ -102,6 +108,7 @@ _SIGNATURES = {
     'acl_get_file': ([C.c_char_p, C.c_int], C.c_void_p),
     'acl_init': ([C.c_int], C.c_void_p),
     'acl_set_file': ([C.c_char_p, C.c_int, C.c_void_p], C.c_int),
+    'acl_set_fd_np': ([C.c_int, C.c_void_p, C.c_int], C.c_int),
     'acl_to_text': ([C.c_void_p, C.c_void_p], C.c_void_p),
     'acl_from_text': ([C.c_char_p], C.c_void_p),
     'acl_free': ([C.c_void_p], C.c_int),
@@ -216,6 +223,10 @@ class Native:
     def swap(self, a, b):
         """RENAME_SWAP exchanges two names atomically; neither is ever missing."""
         check(self.lib.renamex_np(os.fsencode(a), os.fsencode(b), RENAME_SWAP))
+
+    def rename_exclusive(self, source, destination):
+        """Publish atomically only if the destination name is absent."""
+        check(self.lib.renamex_np(os.fsencode(source), os.fsencode(destination), RENAME_EXCL))
 
     # ------------------------------------------------------------ open files
     def _open_uses(self, mappings):
@@ -379,6 +390,22 @@ class Native:
         header = self.decmpfs(path)
         return DECMPFS_CODECS.get(header[0]) if header else None
 
+    def require_verified_compression_xattrs(self, path, visible=None):
+        """Reject compressed files whose user metadata cannot be verified."""
+        if visible is None:
+            visible = self.xattr_names(path, XATTR_NOFOLLOW)
+        hidden = set(self.xattr_names(path, XATTR_NOFOLLOW | XATTR_SHOWCOMPRESSION))
+        hidden.difference_update(visible)
+        hidden.discard(os.fsencode(DECMPFS_XATTR))
+        if RESOURCE_FORK_XATTR in hidden:
+            header = self.decmpfs(path)
+            if header and header[0] in DECMPFS_RESOURCE_FORK_TYPES:
+                hidden.remove(RESOURCE_FORK_XATTR)
+        if hidden:
+            names = ', '.join(os.fsdecode(name) for name in sorted(hidden))
+            raise OSError(errno.ENOTSUP, f'Compressed file has unverified hidden xattrs ({names})',
+                          os.fspath(path))
+
     def exclude_from_backups(self, path):
         """Same effect as `tmutil addexclusion PATH`, which takes seconds to run."""
         self.set_xattr(path, BACKUP_EXCLUDE_XATTR,
@@ -404,6 +431,15 @@ class Native:
         finally:
             self.lib.acl_free(ptr)
 
+    def clear_fd_acl(self, fd):
+        acl = self.lib.acl_init(0)
+        if not acl:
+            check(-1)
+        try:
+            check(self.lib.acl_set_fd_np(fd, acl, ACL_TYPE_EXTENDED))
+        finally:
+            self.lib.acl_free(acl)
+
     def birth(self, path, nofollow=False):
         """Creation time as the raw 16-byte timespec getattrlist returns."""
         attr = AttrList(5, 0, ATTR_CMN_CRTIME, 0, 0, 0, 0)
@@ -422,16 +458,21 @@ class Native:
         UF_COMPRESSED is masked out: it describes storage, not user metadata.
         """
         s = os.lstat(path)
+        attrs = self.xattrs(path, XATTR_NOFOLLOW if nofollow else 0)
+        if s.st_flags & UF_COMPRESSED:
+            self.require_verified_compression_xattrs(path, attrs)
         return (s.st_mode, s.st_uid, s.st_gid, s.st_flags & ~UF_COMPRESSED,
-                s.st_mtime_ns, self.birth(path, nofollow), self.xattrs(path, int(nofollow)),
-                self.acl(path, nofollow))
+                s.st_mtime_ns, self.birth(path, nofollow), attrs, self.acl(path, nofollow))
 
     def restore(self, path, metadata, atime):
         """Apply metadata() of another file to the regular file at path."""
         mode, uid, gid, flags, mtime, birth, attrs, acl = metadata
         p = os.fsencode(path)
         # Hidden APFS compression xattrs must stay paired with UF_COMPRESSED.
-        for name in self.xattr_names(path):
+        current_attrs = self.xattr_names(path)
+        if os.lstat(path).st_flags & UF_COMPRESSED:
+            self.require_verified_compression_xattrs(path, current_attrs)
+        for name in current_attrs:
             if name not in attrs:
                 self.remove_xattr(path, name)
         for name, value in attrs.items():
@@ -460,6 +501,34 @@ def signature(s):
 def unchanged(current, recorded):
     """Compare signatures except ctime, which every rename updates."""
     return current[:4] == recorded[:4] and current[5:] == recorded[5:]
+
+
+def metadata_digest(value):
+    mode, uid, gid, flags, mtime, birthtime, attrs, acl = value
+    payload = [mode, uid, gid, flags, mtime, birthtime.hex(),
+               sorted((key.hex(), data.hex()) for key, data in attrs.items()), acl.hex()]
+    return hashlib.sha256(json.dumps(payload).encode()).hexdigest()
+
+
+def file_checkpoint(native, path):
+    before = signature(path.lstat())
+    if not stat.S_ISREG(before[5]) or before[-1] != 1:
+        raise Conflict(f'Expected an independently linked regular file: {path}')
+    generation = native.generation(path)
+    metadata = metadata_digest(native.metadata(path, nofollow=True))
+    if generation == 0 or native.generation(path) != generation or signature(path.lstat()) != before:
+        raise Conflict(f'File changed while verifying: {path}')
+    return {'signature': before, 'generation': generation, 'metadata': metadata}
+
+
+def matches_checkpoint(native, path, expected):
+    try:
+        observed = file_checkpoint(native, path)
+    except (OSError, Conflict):
+        return False
+    return (unchanged(observed['signature'], expected['signature'])
+            and observed['generation'] == expected['generation']
+            and observed['metadata'] == expected['metadata'])
 
 
 def lstat_or_none(path):
@@ -515,6 +584,73 @@ def sync_file(path):
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def private_stage_directory(native, directory, identity, missing_ok=False):
+    """Return the inode-addressed path to a verified owner-only stage.
+
+    Use Darwin volfs so a rename in a shared parent cannot redirect a clone
+    or metadata write into a substituted directory.
+    """
+    if (not isinstance(identity, (tuple, list)) or len(identity) != 2
+            or any(type(value) is not int or value <= 0 for value in identity)):
+        raise Conflict('Invalid staging directory identity')
+    device, inode = identity
+    anchor = Path('/.vol') / str(device) / str(inode)
+    named, anchored = lstat_or_none(directory), lstat_or_none(anchor)
+    if named is None and anchored is None and missing_ok:
+        return None
+    for status in (named, anchored):
+        if (status is None or (status.st_dev, status.st_ino) != (device, inode)
+                or status.st_uid != os.geteuid() or not stat.S_ISDIR(status.st_mode)
+                or stat.S_IMODE(status.st_mode) != 0o700):
+            raise Conflict(f'Staging directory moved, changed or unavailable: {directory} ({anchor})')
+    if native.acl(anchor, nofollow=True) != EMPTY_ACL:
+        raise Conflict(f'Staging directory has an access ACL: {directory}')
+    return anchor
+
+
+def make_private_stage(native, directory):
+    """Create an empty private stage, removing any inherited ACL before use."""
+    directory.mkdir(mode=0o700)
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        identity = [st.st_dev, st.st_ino]
+        anchor = Path('/.vol') / str(st.st_dev) / str(st.st_ino)
+        if st.st_uid != os.geteuid():
+            raise Conflict(f'Staging directory is not owned by this user: {directory}')
+        if stat.S_IMODE(st.st_mode) != 0o700:
+            os.fchmod(fd, 0o700)
+        if native.acl(anchor, nofollow=True) != EMPTY_ACL:
+            native.clear_fd_acl(fd)
+        private_stage_directory(native, directory, identity)
+        sync_dir(directory.parent)
+        return identity
+    finally:
+        os.close(fd)
+
+
+def tracked_staging_path(native, root, destination, record, prefix):
+    """Return the journaled name and accessible payload, including legacy stages."""
+    temporary = safe_path(root, record['temporary'])
+    if 'staging_directory' not in record:
+        if temporary.parent != destination.parent or not temporary.name.startswith(prefix):
+            raise Conflict('Invalid legacy staging path in journal')
+        return temporary, temporary
+    directory = temporary.parent
+    if (directory.parent != destination.parent or not directory.name.startswith(prefix)
+            or temporary.name != STAGE_PAYLOAD):
+        raise Conflict('Invalid private staging path in journal')
+    anchor = private_stage_directory(native, directory, record['staging_directory'], missing_ok=True)
+    return temporary, anchor / STAGE_PAYLOAD if anchor is not None else None
+
+
+def remove_private_stage(native, temporary, identity):
+    """Remove an empty stage, preserving unexpected entries for inspection."""
+    if private_stage_directory(native, temporary.parent, identity, missing_ok=True) is not None:
+        temporary.parent.rmdir()
+        sync_dir(temporary.parent.parent)
 
 
 def atomic_write(path, data, durable=False):

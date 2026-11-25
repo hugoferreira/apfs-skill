@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import queue
 import struct
@@ -189,7 +190,7 @@ class CoreTests(unittest.TestCase):
 
             def execute(command, **kwargs):
                 if command[0] == "ditto":
-                    Path(command[-1]).write_bytes(Path(command[-2]).read_bytes())
+                    Path(kwargs["cwd"], command[-1]).write_bytes(Path(command[-2]).read_bytes())
                     return SimpleNamespace(stdout="", stderr="")
                 return SimpleNamespace(
                     stdout="", stderr=f"{command[-1]}: Permission denied\n"
@@ -212,7 +213,7 @@ class CoreTests(unittest.TestCase):
 
             def execute(command, **kwargs):
                 if command[0] == "ditto":
-                    Path(command[-1]).write_bytes(b"")
+                    Path(kwargs["cwd"], command[-1]).write_bytes(b"")
                 return SimpleNamespace(stdout="", stderr="")
 
             with mock.patch.object(app, "BASE", ["afsctool"]), \
@@ -233,7 +234,7 @@ class CoreTests(unittest.TestCase):
 
             def execute(command, **kwargs):
                 if command[0] == "ditto":
-                    Path(command[-1]).write_bytes(Path(command[-2]).read_bytes())
+                    Path(kwargs["cwd"], command[-1]).write_bytes(Path(command[-2]).read_bytes())
                 return SimpleNamespace(stdout="", stderr="")
 
             with mock.patch.object(app, "BASE", ["afsctool"]), \
@@ -404,7 +405,7 @@ class CoreTests(unittest.TestCase):
             path.write_bytes(b"original" * 1024)
 
             def execute(command, **kwargs):
-                Path(command[-1]).write_bytes(Path(command[-2]).read_bytes())
+                Path(kwargs["cwd"], command[-1]).write_bytes(Path(command[-2]).read_bytes())
                 path.write_bytes(b"written after the copy" * 1024)
                 return SimpleNamespace(stdout="", stderr="")
 
@@ -424,6 +425,125 @@ class CoreTests(unittest.TestCase):
             self.assertFalse(any(path.parent.glob(
                 f"{app.ATOMIC_TEMP_PREFIX}*"
             )))
+
+    def test_ditto_recovers_missing_flag_on_verified_sibling_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "cold.txt")
+            content = b"compressible text for staged verification\n" * 60_000
+            path.write_bytes(content)
+            path.chmod(0o751)
+            app.native().set_xattr(path, b"org.example.test", b"value")
+            metadata = app.native().metadata(path)
+            original = path.stat()
+
+            def write_without_flag(command, *, cwd):
+                result = app.subprocess.run(command, check=True,
+                                            capture_output=True, text=True, cwd=cwd)
+                staged = Path(cwd, command[-1])
+                os.chflags(staged, staged.stat().st_flags & ~app.stat.UF_COMPRESSED)
+                self.assertEqual(staged.stat().st_size, 0)
+                return result
+
+            with mock.patch.object(app, "BASE", ["ditto", "--hfsCompression",
+                                                  "--noclone"]), \
+                 mock.patch.object(app, "run_command", side_effect=write_without_flag):
+                self.assertTrue(app.ditto_compress_file(path))
+
+            self.assertEqual(path.read_bytes(), content)
+            self.assertEqual(app.native().metadata(path), metadata)
+            self.assertTrue(app.already_compressed(path))
+            self.assertLess(path.stat().st_blocks, original.st_blocks)
+            self.assertNotEqual(path.stat().st_ino, original.st_ino)
+
+    def test_late_xattr_write_rolls_back_compression(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "cold")
+            path.write_bytes(b"compression rollback\n" * 90_000)
+            inode = path.stat().st_ino
+            real_swap = app.Native.swap
+
+            def swap(native, staged, target):
+                if Path(target).lstat().st_ino == inode:
+                    native.set_xattr(target, b"org.example.late", b"original edit")
+                real_swap(native, staged, target)
+
+            with mock.patch.object(app, "BASE", ["ditto", "--hfsCompression", "--noclone"]), \
+                 mock.patch.object(app.Native, "swap", swap), \
+                 self.assertRaisesRegex(RuntimeError, "Original restored"):
+                app.ditto_compress_file(path)
+
+            self.assertEqual(path.stat().st_ino, inode)
+            self.assertEqual(app.native().xattr(path, b"org.example.late"), b"original edit")
+            self.assertFalse(app.publication_directory(path).exists())
+
+    def test_two_xattr_updates_leave_both_compression_versions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "cold")
+            path.write_bytes(b"keep both versions\n" * 100_000)
+            real_swap = app.Native.swap
+
+            def swap(native, staged, target):
+                native.set_xattr(target, b"org.example.late", b"original edit")
+                real_swap(native, staged, target)
+                native.set_xattr(target, b"org.example.late", b"replacement edit")
+
+            with mock.patch.object(app, "BASE", ["ditto", "--hfsCompression", "--noclone"]), \
+                 mock.patch.object(app.Native, "swap", swap), \
+                 self.assertRaisesRegex(app.PublicationConflict, "Review both"):
+                app.ditto_compress_file(path)
+
+            stage = app.publication_directory(path)
+            for dry_run in (True, False):
+                with self.assertRaisesRegex(app.PublicationConflict, "Review both"):
+                    app.recover_publication(app.native(), stage, dry_run)
+            self.assertEqual(app.native().xattr(stage / "payload", b"org.example.late"), b"original edit")
+            self.assertEqual(app.native().xattr(path, b"org.example.late"), b"replacement edit")
+
+    def test_repair_cli_recovers_after_interruption_immediately_after_swap(self):
+        script = Path(app.__file__)
+        child = """
+import os
+from pathlib import Path
+import sys
+import apfs_compress_plus as app
+app.select_backend('ditto')
+real = app.Native.swap
+def interrupted_swap(native, staged, path):
+    real(native, staged, path)
+    os._exit(73)
+app.Native.swap = interrupted_swap
+app.ditto_compress_file(Path(sys.argv[1]))
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "cold")
+            data = b"interrupted compression\n" * 90_000
+            path.write_bytes(data)
+            app.native().set_xattr(path, b"org.example.metadata", b"keep")
+            metadata, inode = app.native().metadata(path), path.stat().st_ino
+            result = subprocess.run([sys.executable, "-B", "-c", child, str(path)],
+                                    cwd=script.parent, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 73, result.stderr)
+            self.assertTrue(app.already_compressed(path))
+            stage = app.publication_directory(path)
+            self.assertEqual((stage / "payload").stat().st_ino, inode)
+            state = Path(directory, "state.sqlite")
+            alias = path.with_name("COLD")
+            target = alias if alias.exists() else path
+            retry = subprocess.run([sys.executable, "-B", str(script), "file", "compress",
+                                    str(target), "--backend", "ditto", "--state-db", str(state),
+                                    "--json"], capture_output=True, text=True)
+            self.assertEqual(retry.returncode, app.EXIT_CONFLICT, retry.stderr)
+            self.assertEqual(json.loads(retry.stdout)["error"], "publication_pending")
+            args = [sys.executable, "-B", str(script), "file", "repair", str(target),
+                    "--only", "interrupted_swap", "--state-db", str(state), "--json"]
+            preview = subprocess.run([*args, "--dry-run"], check=True, capture_output=True, text=True)
+            self.assertEqual(json.loads(preview.stdout)["publications_recovered"], 1)
+            self.assertTrue(app.already_compressed(path))
+            subprocess.run(args, check=True, capture_output=True, text=True)
+            self.assertEqual(path.stat().st_ino, inode)
+            self.assertEqual(path.read_bytes(), data)
+            self.assertEqual(app.native().metadata(path), metadata)
+            self.assertFalse(stage.exists())
 
     def test_open_file_users_returns_process_and_access_metadata(self):
         use = app.OpenUse
@@ -455,7 +575,7 @@ class CoreTests(unittest.TestCase):
 
             def execute(command, **kwargs):
                 if command[0] == "ditto":
-                    Path(command[-1]).write_bytes(Path(command[-2]).read_bytes())
+                    Path(kwargs["cwd"], command[-1]).write_bytes(Path(command[-2]).read_bytes())
                 return SimpleNamespace(stdout="", stderr="")
 
             users = [{"pid": 123, "command": "Editor", "access": "u"}]
@@ -834,7 +954,7 @@ class CoreTests(unittest.TestCase):
 
             def execute(command, **kwargs):
                 if command[0] == "ditto":
-                    Path(command[-1]).write_bytes(Path(command[-2]).read_bytes())
+                    Path(kwargs["cwd"], command[-1]).write_bytes(Path(command[-2]).read_bytes())
                 return SimpleNamespace(stdout="Unable to compress file.",
                                        stderr="")
 

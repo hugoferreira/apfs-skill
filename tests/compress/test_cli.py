@@ -265,7 +265,7 @@ class CLIContractTests(unittest.TestCase):
             candidate = root / "candidate.txt"
             candidate.write_text("compressible\n" * 1000)
             state = root / "state.sqlite"
-            common = (candidate, "--cutoff-days", "0", "--min-size", "1",
+            common = (candidate, "--backend", "ditto", "--cutoff-days", "0", "--min-size", "1",
                       "--ratio", "1", "--state-db", state, "--json")
             with open(f"{state}.lock", "a+") as holder:
                 fcntl.flock(holder, fcntl.LOCK_EX)
