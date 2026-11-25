@@ -671,12 +671,10 @@ def remove_orphan_stage(directory):
 
 
 def tracked_staging_path(native, root, destination, record, prefix):
-    """Return the journaled name and accessible payload, including legacy stages."""
+    """Return the journaled name and the accessible payload, or None if the stage is gone."""
     temporary = safe_path(root, record['temporary'])
     if 'staging_directory' not in record:
-        if temporary.parent != destination.parent or not temporary.name.startswith(prefix):
-            raise Conflict('Invalid legacy staging path in journal')
-        return temporary, temporary
+        raise Conflict('Staging record of an earlier format; delete the state directory or journal that holds it')
     directory = temporary.parent
     if (directory.parent != destination.parent or not directory.name.startswith(prefix)
             or temporary.name != STAGE_PAYLOAD):

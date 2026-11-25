@@ -23,7 +23,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from apfs_common import (EF_SHARES_ALL_BLOCKS, PROVENANCE_XATTR, SF_DATALESS, STAGE_PAYLOAD,
                          STAGING_PREFIXES, UF_COMPRESSED, UNSAFE_FLAGS,
-                         XATTR_NOFOLLOW, Conflict, Native, allocated_bytes, file_checkpoint,
+                         XATTR_NOFOLLOW, Conflict, Native, allocated_bytes,
                          free_bytes, hash_fd, human_bytes, lstat_or_none, make_private_stage,
                          matches_checkpoint, metadata_digest, on_device, private_stage_directory,
                          remove_orphan_stage, remove_private_stage, safe_path, signature,
@@ -31,7 +31,8 @@ from apfs_common import (EF_SHARES_ALL_BLOCKS, PROVENANCE_XATTR, SF_DATALESS, ST
 from apfs_job import Job, Progress, control, default_state
 
 VERSION = '1.7.0'
-JOURNAL_INDEX_VERSION = 2
+JOURNAL_INDEX_VERSION = 3
+HEADER_VERSION = 2
 PREFIX = '.apfs-dedupe-stage-'
 COMPRESSED = UF_COMPRESSED
 # Staged clones are exchanged in batches; one open-file snapshot covers a batch.
@@ -168,43 +169,30 @@ def root_identity(root):
 def validate_header(records, root):
     """Require the journal of this root.
 
-    A header with 'volume' is bound to the root directory by volume UUID and
-    inode, so a renamed or remounted root keeps its journal. Older headers
-    are bound to the root path.
+    The header binds the journal to the root directory by volume UUID and
+    inode, so a renamed or remounted root keeps its journal. 'root' records
+    the path at creation for the reader.
     """
     if not records:
         return
     header = records[0]
-    expected = {'event': 'header', 'version': 1, 'root': str(root)}
-    bound = header.get('volume') if isinstance(header, dict) else None
-    if bound:
-        valid = ({**header, 'root': str(root)} == {**expected, 'volume': bound}
-                 and bound == root_identity(root))
-    else:
-        valid = header == expected
-    if not valid:
+    if (not isinstance(header, dict) or header.get('event') != 'header'
+            or header.get('version') != HEADER_VERSION or set(header) != {'event', 'version', 'root', 'volume'}
+            or not header['volume'] or header['volume'] != root_identity(root)):
         raise Conflict('Journal belongs to another root or version. '
                        'If this tree is a copy of a deduplicated tree, delete the copied journal')
 
 
-def journal_records(fd, compressed, on_record=None):
+def journal_records(fd, on_record=None):
     """Return complete records and the safe append offset; reject corruption.
 
-    A compressed append is one complete member. Only records from members with
+    An append is one complete gzip member. Only records from members with
     validated deflate data and CRC/trailer are accepted. A partial final member
     never authorized a filesystem mutation, so it may be dropped on recovery.
     """
     os.lseek(fd, 0, os.SEEK_SET)
     records, end = [], 0
     with os.fdopen(os.dup(fd), 'rb') as raw:
-        if not compressed:
-            for line in raw:
-                if not line.endswith(b'\n'):
-                    break
-                record = json.loads(line)
-                on_record(record) if on_record else records.append(record)
-                end += len(line)
-            return records, end
         decoder = zlib.decompressobj(31)
         parts, offset = [], 0
         while True:
@@ -229,68 +217,40 @@ def journal_records(fd, compressed, on_record=None):
                 end = offset
                 chunk = decoder.unused_data
                 decoder, parts = zlib.decompressobj(31), []
-        # Bulk members are only produced by atomic migration. Their truncation
-        # indicates damage, not an interrupted single-record append.
+        # An append writes one record. A truncated member with more indicates
+        # damage, not an interrupted append.
         if b''.join(parts).count(b'\n') > 1:
             raise Conflict('Truncated bulk gzip member; journal left intact')
     return records, end
 
 
-def legacy_journal(path):
-    """Name of the uncompressed journal older versions wrote: PATH without .gz."""
-    return Path(str(path)[:-3])
-
-
-def migrate_journal(path, root):
-    """Publish and verify gzip before removing an owned, locked legacy journal."""
-    legacy = legacy_journal(path)
-    if not legacy.exists() and not legacy.is_symlink():
-        return
-    oldfd = os.open(legacy, os.O_RDONLY | os.O_NOFOLLOW)
-    tmp = path.parent / (PREFIX + uuid.uuid4().hex)
+def old_format(path):
+    """True if path is a journal of an earlier format, which is not read."""
     try:
-        original = validate_journal_file(oldfd)
-        fcntl.flock(oldfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        records, _ = journal_records(oldfd, False)
-        validate_header(records, root)
-        if path.exists() or path.is_symlink():
-            # Resume an interruption between publishing gzip and unlinking plain.
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-            try:
-                validate_journal_file(fd)
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                existing, _ = journal_records(fd, True)
-                validate_header(existing, root)
-                if existing[:len(records)] != records:
-                    raise Conflict('Plain and gzip journals differ; both left intact')
-            finally:
-                os.close(fd)
-        else:
-            fd = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-            try:
-                with os.fdopen(os.dup(fd), 'wb') as raw:
-                    with gzip.GzipFile(filename='', fileobj=raw, mode='wb', mtime=0) as out:
-                        for record in records:
-                            out.write((json.dumps(record, sort_keys=True) + '\n').encode())
-                    raw.flush()
-                    os.fsync(raw.fileno())
-                verified, end = journal_records(fd, True)
-                if verified != records or end != os.fstat(fd).st_size:
-                    raise Conflict('Compressed journal migration failed verification')
-            finally:
-                os.close(fd)
-            if signature(legacy.lstat()) != signature(original):
-                raise Conflict('Legacy journal changed during migration; original retained')
-            os.replace(tmp, path)
-            sync_dir(path.parent)
-        if signature(legacy.lstat()) != signature(original):
-            raise Conflict('Legacy journal changed during migration; both left intact')
-        legacy.unlink()
-        sync_dir(path.parent)
-    finally:
-        os.close(oldfd)
-        if tmp.exists():
-            tmp.unlink()
+        with gzip.open(path, 'rb') as stream:
+            line = stream.readline()
+        header = json.loads(line) if line else None
+    except (OSError, EOFError, ValueError, zlib.error):
+        # An uncompressed journal is the oldest format. Damage in a current
+        # journal is reported when the journal is opened.
+        with open(path, 'rb') as stream:
+            return stream.read(2) != b'\x1f\x8b'
+    return header is not None and not (isinstance(header, dict) and header.get('event') == 'header'
+                                       and header.get('version') == HEADER_VERSION)
+
+
+def clear_old_journals(path, emit):
+    """Delete journals of earlier formats. They are neither migrated nor recovered."""
+    for candidate in (Path(str(path)[:-3]), path):
+        status = lstat_or_none(candidate)
+        if (status is None or not stat.S_ISREG(status.st_mode) or status.st_uid != os.geteuid()
+                or status.st_nlink != 1 or status.st_size == 0 and candidate == path):
+            continue
+        if candidate == path and not old_format(path):
+            continue
+        candidate.unlink()
+        sync_dir(candidate.parent)
+        emit(f'Removed journal of an earlier format: {candidate}')
 
 
 class SignatureMap:
@@ -364,7 +324,7 @@ class DiskRecords:
         return {key: json.loads(value) for key, value in self.job.db.execute("SELECT key,value FROM dedupe_history WHERE kind='pending'")}
 
 
-def load_disk_records(fd, compressed, job, path, root):
+def load_disk_records(fd, job, path, root):
     records = DiskRecords(job)
     cached = job.get('journal-index', str(path), signature(os.fstat(fd)))
     if cached is not None and cached.get('version') == JOURNAL_INDEX_VERSION:
@@ -385,7 +345,7 @@ def load_disk_records(fd, compressed, job, path, root):
             job.checkpoint()
             job.publish(phase='Recovering journal', files_done=0, files_total=None, records_done=count,
                         bytes_done=os.lseek(fd, 0, os.SEEK_CUR), bytes_total=os.fstat(fd).st_size)
-    _, end = journal_records(fd, compressed, on_record=consume)
+    _, end = journal_records(fd, on_record=consume)
     validate_header(records, root)
     job.put('journal-index', str(path), signature(os.fstat(fd)), {'end': end, 'version': JOURNAL_INDEX_VERSION})
     job.flush()
@@ -396,26 +356,24 @@ class Journal:
     def __init__(self, path, root, job=None):
         self.job = job
         self.path, self.root = path, root
-        self.compressed = str(path).endswith('.gz')
         self.fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             validate_journal_file(self.fd)
             fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             if job:
-                self.records, end = load_disk_records(self.fd, self.compressed, job, path, root)
+                self.records, end = load_disk_records(self.fd, job, path, root)
             else:
-                self.records, end = journal_records(self.fd, self.compressed)
+                self.records, end = journal_records(self.fd)
             validate_header(self.records, root)
             if end != os.fstat(self.fd).st_size:
                 os.ftruncate(self.fd, end)
                 os.fsync(self.fd)
             os.lseek(self.fd, 0, os.SEEK_END)
             if not self.records:
-                header = dict(event='header', version=1, root=str(root))
                 identity = root_identity(root)
-                if identity:
-                    header['volume'] = identity
-                self.add(**header)
+                if not identity:
+                    raise Conflict('Root must be a directory on an APFS volume: ' + str(root))
+                self.add(event='header', version=HEADER_VERSION, root=str(root), volume=identity)
                 sync_dir(path.parent)
         except BaseException:
             os.close(self.fd)
@@ -425,9 +383,7 @@ class Journal:
         os.close(self.fd)
 
     def add(self, **record):
-        data = (json.dumps(record, sort_keys=True) + '\n').encode()
-        if self.compressed:
-            data = gzip.compress(data, compresslevel=6, mtime=0)
+        data = gzip.compress((json.dumps(record, sort_keys=True) + '\n').encode(), compresslevel=6, mtime=0)
         try:
             while data:
                 data = data[os.write(self.fd, data):]
@@ -465,15 +421,13 @@ class Journal:
             elif r['event'] == 'aborted':
                 pending.pop(r['id'], None)
         native = Native() if pending else None
-        # Device numbers change with attach order. The job identity or the
-        # journal header has matched the volume UUID, so recorded identities
-        # are read with the root's current device.
-        header = self.records[0] if self.records else None
-        same_volume = self.job is not None or bool(header and header.get('volume'))
+        # Device numbers change with attach order. The journal header has
+        # matched the volume UUID, so recorded identities are read with the
+        # root's current device.
         device = self.root.stat().st_dev if pending else None
         for r in pending.values():
             recorded = r.get('staging_directory')
-            if same_volume and recorded and recorded[0] != device:
+            if recorded and recorded[0] != device:
                 r['staging_directory'] = on_device(recorded, device)
                 for key in ('original', 'prepared'):
                     r[key] = on_device(r.get(key), device)
@@ -495,39 +449,21 @@ class Journal:
                         raise Conflict(conflict_message(name, dst))
                     busy = open_files()
                     try:
-                        original_checkpoint = None
-                        if fingerprint is not None:
-                            original_checkpoint = dict(signature=original, metadata=fingerprint,
-                                                       generation=r.get('original_generation'))
-                        else:
-                            # A legacy journal has no metadata fingerprint. A rollback is
-                            # safe only when the replacement still has the recorded bytes
-                            # and both files have equivalent user-visible metadata.
-                            try:
-                                if hash_file(dst)[0] != r['sha256']:
-                                    raise Conflict(conflict_message(name, dst))
-                                current = file_checkpoint(native, dst)
-                                if current['metadata'] != metadata_digest(native.metadata(tmp, nofollow=True)):
-                                    raise Conflict(conflict_message(name, dst))
-                                replacement.update(metadata=current['metadata'],
-                                                   generation=current['generation'])
-                            except (Skip, OSError) as error:
-                                raise Conflict(conflict_message(name, dst)) from error
+                        original_checkpoint = dict(signature=original, metadata=fingerprint,
+                                                   generation=r.get('original_generation'))
                         settle_swapped(native, tmp, dst, replacement, tuple(staged[:2]) in busy,
                                        original_checkpoint, display=name)
                     except Conflict:
                         self.add(event='conflict', id=ident)
                         raise
                 else:
-                    if staged and (signature(s) != staged or fingerprint is not None):
-                        # The ctime may have changed during an interrupted rollback.
-                        if (fingerprint is None or tuple(staged[:2]) in open_files()
-                                or not matches_checkpoint(native, tmp, replacement)):
-                            raise Conflict('Staging file changed or is open: ' + str(name))
+                    # The ctime may have changed during an interrupted rollback.
+                    if staged and (tuple(staged[:2]) in open_files()
+                                   or not matches_checkpoint(native, tmp, replacement)):
+                        raise Conflict('Staging file changed or is open: ' + str(name))
                     tmp.unlink()
                     sync_dir(tmp.parent)
-            if directory is not None:
-                remove_private_stage(native, name, directory)
+            remove_private_stage(native, name, directory)
             if s is None and staged and lstat_or_none(dst) is not None:
                 try:
                     digest, sig = hash_file(dst)
@@ -815,9 +751,9 @@ def read_completed(path, root, job=None):
         validate_journal_file(fd)
         fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
         if job:
-            lines, _ = load_disk_records(fd, str(path).endswith('.gz'), job, path, root)
+            lines, _ = load_disk_records(fd, job, path, root)
             return SignatureMap(lines, 'done'), read_exclusions(lines)
-        lines, _ = journal_records(fd, str(path).endswith('.gz'))
+        lines, _ = journal_records(fd)
         validate_header(lines, root)
         return ({r['destination']: r['signature'] for r in lines if r['event'] == 'done'},
                 read_exclusions(lines))
@@ -842,7 +778,7 @@ def directory_groups(root, groups, exclusions, journal_path):
     """
     device = root.stat().st_dev
     member = {path: index for index, (_, paths) in enumerate(groups) for path, _ in paths}
-    blocked = {journal_path, legacy_journal(journal_path)}
+    blocked = {journal_path}
     interned, info, memo = {}, [], {}
 
     def signature(directory):
@@ -1104,7 +1040,7 @@ def scan(root, minimum, exclusions, journal_path, progress, native, skip, stages
                 progress.job.publish(phase='Scanning', files_done=seen, files_total=None,
                                      bytes_done=0, bytes_total=None, current_path=str(Path(directory) / name))
             path = Path(directory) / name
-            if name in exclusions or name.startswith(PREFIX) or path in (journal_path, legacy_journal(journal_path)):
+            if name in exclusions or name.startswith(PREFIX) or path == journal_path:
                 continue
             s = lstat_or_none(path)
             if s is None:
@@ -1311,7 +1247,6 @@ def main(argv=None):
         jp = (args.journal.expanduser().absolute() if args.journal else root / '.apfs-dedupe.jsonl.gz')
         if not str(jp).endswith('.gz'):
             jp = Path(str(jp) + '.gz')
-        legacy_jp = legacy_journal(jp)
         native = Native()
         skipped = []
         def skip(path, error):
@@ -1329,19 +1264,22 @@ def main(argv=None):
         if args.apply:
             rootfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
             fcntl.flock(rootfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            migrate_journal(jp, root)
+            clear_old_journals(jp, progress.emit)
             journal = Journal(jp, root, job=job)
             completed = journal.recover(native.open_files)
             previous_exclusions = read_exclusions(journal.records)
         else:
-            read_path = jp if jp.exists() or jp.is_symlink() else legacy_jp
-            if job is None and read_path.exists():
+            # A journal of an earlier format is ignored here and removed by --apply.
+            status = lstat_or_none(jp)
+            readable = status is not None and not (stat.S_ISREG(status.st_mode) and old_format(jp))
+            if job is None and readable:
                 temporary_state = tempfile.TemporaryDirectory(prefix='apfs-dedupe-preview-')
                 job = Job(Path(temporary_state.name), {'tool': 'dedupe-preview', 'root': str(root)})
                 progress.job = job
-            completed, previous_exclusions = read_completed(read_path, root, job=job)
+            if readable:
+                completed, previous_exclusions = read_completed(jp, root, job=job)
         origins = {}
-        if job and (args.apply or read_path.exists()):
+        if job and (args.apply or readable):
             origins = SignatureMap(DiskRecords(job), 'origin')
         stages = [] if args.apply else None
         groups, scanned, excluded, unmatched = scan(root, args.min_size, {'.git', *args.exclude}, jp, progress,

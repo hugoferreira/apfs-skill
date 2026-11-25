@@ -48,12 +48,12 @@ The first run against an old journal streams and indexes it, with recovery progr
 ### Dedupe journal and replacement details
 
 - The journal is fsync'd gzip JSON Lines. Each append is one complete gzip member; an interrupted final member is discarded on the next `--apply`. Inspect it with `gzip -dc JOURNAL`; do not recompress an active journal.
-- New journals are bound to the root directory by volume UUID and inode, so a renamed root or a remounted volume keeps its journal. Journals written by earlier versions are bound to the root path. A copy of a deduplicated tree needs its copied journal deleted; `apfs-transfer.py` does not copy dedupe journals.
+- The journal is bound to the root directory by volume UUID and inode, so a renamed root or a remounted volume keeps its journal. A copy of a deduplicated tree needs its copied journal deleted; `apfs-transfer.py` does not copy dedupe journals.
+- Journals of earlier formats (header version 1, or uncompressed `.jsonl`) are not read. A dry run ignores them and `--apply` deletes them, so completed replacements they recorded are rediscovered through clone IDs. A stage they left behind is not recovered; inspect any remaining `.apfs-dedupe-stage-*` entry by hand. A transfer state directory with staging records of the earlier format is refused; delete it and rerun.
 - Dataless files (iCloud, File Provider) are not hashed or replaced.
 - The journal lock serializes cooperating runs that use the same journal. Do not run different journals concurrently against overlapping trees.
-- Clone payloads stay in owner-only stage directories until publication. The tool strips inherited ACLs before copying and addresses the verified stage by inode. Recovery accepts legacy flat stages and records the directory identity for new ones.
+- Clone payloads stay in owner-only stage directories until publication. The tool strips inherited ACLs before copying and addresses the verified stage by inode. The journal records the directory identity for recovery.
 - The tree may be in use; see "Deduplicating a tree in use".
-- Legacy `.jsonl` journals are migrated to gzip on `--apply`, after verification. Dry runs read them without migrating.
 - A dry run writes no journal and does not recover interrupted staging. Reading files may update their access times.
 - Replacement keeps data, mode, ownership, mtime, birthtime, visible xattrs and ACLs, and verifies them before the rename. Inodes, ctime and parent directory timestamps change, and APFS's internal compression flag may change to match the cloned storage. There is no fallback to a full copy.
 - Files with different `com.apple.provenance` are never merged; they are reported as `provenance_unmatched_files` and left intact.

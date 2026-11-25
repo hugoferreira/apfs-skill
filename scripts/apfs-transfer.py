@@ -181,8 +181,7 @@ def recover(job, destination, native, progress):
                 job.put('done', rel, [value['source_signature'], actual], value['result'])
             elif actual[:2] == expected[:2]:
                 raise Conflict('Published file changed before recovery: ' + str(dst))
-        if 'staging_directory' in value:
-            remove_private_stage(native, name, value['staging_directory'])
+        remove_private_stage(native, name, value['staging_directory'])
         job.db.execute("DELETE FROM cache WHERE kind='pending' AND path=?", (rel,))
         job.flush()
 

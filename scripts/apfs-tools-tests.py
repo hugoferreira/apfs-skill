@@ -270,7 +270,9 @@ finally:
         db = sqlite3.connect(self.state / 'checkpoints.sqlite3')
         row = db.execute("SELECT signature,value FROM cache WHERE kind='done' AND path='a'").fetchone()
         source_sig, dest_sig = json.loads(row[0])
-        pending = {'temporary': PREFIX + 'already-published', 'source_signature': source_sig,
+        stage = self.dest / (PREFIX + 'already-published')
+        pending = {'temporary': f'{stage.name}/{c.STAGE_PAYLOAD}', 'source_signature': source_sig,
+                   'staging_directory': c.make_private_stage(self.native, stage),
                    'prepared': dest_sig, 'result': json.loads(row[1]),
                    'metadata_digest': t.metadata_digest(t.metadata(self.native, self.dest / 'a'))}
         db.execute("DELETE FROM cache WHERE kind='done' AND path='a'")
@@ -280,6 +282,7 @@ finally:
         inode = (self.dest / 'a').stat().st_ino
         self.assertEqual(self.cli('--apply')['resumed_files'], 2)
         self.assertEqual((self.dest / 'a').stat().st_ino, inode)
+        self.assertFalse(stage.exists())
 
     def test_compressed_transfer(self):
         import struct, zlib

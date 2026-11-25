@@ -89,29 +89,35 @@ class Tests(unittest.TestCase):
         r=subprocess.run([sys.executable,str(SCRIPT)],capture_output=True,text=True)
         self.assertEqual(r.returncode,0);self.assertIn('usage:',r.stdout)
     def stage(self, prepared=False, replace=False):
-        a,b=self.pair();ident=uuid.uuid4().hex;t=self.root/(d.PREFIX+ident)
-        j=d.Journal(self.root/'.apfs-dedupe.jsonl',self.root)
-        digest=hashlib.sha256(a.read_bytes()).hexdigest()
-        j.add(event='stage',id=ident,source='a',destination='b',temporary=t.name,sha256=digest)
-        self.native.clone(a,t)
-        if prepared:j.add(event='prepared',id=ident,signature=d.signature(t.stat()))
+        # A run that died after staging: before the clone was verified, or after.
+        if prepared:
+            a,b,j,item=self.staged();os.close(item.fd);t=item.tmp
+            self.doCleanups()
+        else:
+            a,b=self.pair();ident=uuid.uuid4().hex;t=self.root/(d.PREFIX+ident)/d.STAGE_PAYLOAD
+            j=d.Journal(self.root/'.apfs-dedupe.jsonl.gz',self.root)
+            digest=hashlib.sha256(a.read_bytes()).hexdigest()
+            identity=d.make_private_stage(self.native,t.parent)
+            j.add(event='stage',id=ident,source='a',destination='b',temporary=str(t.relative_to(self.root)),
+                  staging_directory=identity,sha256=digest)
+            self.native.clone(a,t)
+            os.close(j.fd)
         if replace:os.replace(t,b)
-        os.close(j.fd)
         return a,b,t
     def test_recover_unprepared(self):
         a,b,t=self.stage()
         self.assertEqual(self.run_cli('--apply')['cloned_files'],1)
-        self.assertFalse(t.exists())
+        self.assertFalse(t.parent.exists())
     def test_recover_prepared(self):
         a,b,t=self.stage(prepared=True)
         self.assertEqual(self.run_cli('--apply')['cloned_files'],1)
-        self.assertFalse(t.exists())
+        self.assertFalse(t.parent.exists())
     def test_recover_replaced_and_torn_journal(self):
         a,b,t=self.stage(prepared=True,replace=True);old=b.stat().st_ino
-        with open(self.root/'.apfs-dedupe.jsonl','ab') as f:f.write(b'{"torn":')
+        with open(self.root/'.apfs-dedupe.jsonl.gz','ab') as f:f.write(gzip.compress(b'{"event":"aborted","id":"torn"}\n')[:-4])
         self.assertEqual(self.run_cli('--apply')['cloned_files'],0)
         self.assertEqual(b.stat().st_ino,old)
-        self.assertFalse((self.root/'.apfs-dedupe.jsonl').exists())
+        self.assertFalse(t.parent.exists())
         for line in gzip.decompress((self.root/'.apfs-dedupe.jsonl.gz').read_bytes()).splitlines():json.loads(line)
     def test_gzip_default_and_complete_members(self):
         self.pair();result=self.run_cli('--apply')
@@ -140,31 +146,31 @@ class Tests(unittest.TestCase):
         result=self.run_cli('--apply',code=1)
         self.assertIn('Corrupt gzip journal',result['message'])
         self.assertEqual(path.read_bytes(),data)
-    def test_migration_preserves_completed_state(self):
-        a,b=self.pair();ident=uuid.uuid4().hex;plain=self.root/'.apfs-dedupe.jsonl'
-        j=d.Journal(plain,self.root);_,sa=d.hash_file(a);digest,sb=d.hash_file(b)
-        d.clone_one(self.native,self.root,a,b,digest,sa,sb,j);os.close(j.fd)
-        old=plain.read_bytes();before=b.stat().st_ino
-        self.assertEqual(self.run_cli()['planned_files'],0)
-        self.assertEqual(plain.read_bytes(),old)
-        result=self.run_cli('--apply')
-        self.assertEqual(result['cloned_files'],0)
-        self.assertEqual(b.stat().st_ino,before)
-        self.assertFalse(plain.exists())
-        self.assertEqual(gzip.decompress((self.root/'.apfs-dedupe.jsonl.gz').read_bytes()),old)
-    def test_migration_resumes_after_publish(self):
-        self.pair();plain=self.root/'.apfs-dedupe.jsonl';gz=self.root/'.apfs-dedupe.jsonl.gz'
-        j=d.Journal(plain,self.root);os.close(j.fd)
-        gz.write_bytes(gzip.compress(plain.read_bytes()))
+    def old_journal(self, path, compress):
+        header={'event':'header','version':1,'root':str(self.root)}
+        done={'event':'done','id':'old','destination':'b','signature':d.signature((self.root/'b').stat())}
+        data=b''.join((json.dumps(r,sort_keys=True)+'\n').encode() for r in (header,done))
+        path.write_bytes(gzip.compress(data) if compress else data)
+    def test_journals_of_earlier_formats_are_removed_on_apply(self):
+        a,b=self.pair();old=b.stat().st_ino
+        plain=self.root/'.apfs-dedupe.jsonl';gz=self.root/'.apfs-dedupe.jsonl.gz'
+        self.old_journal(plain,False);self.old_journal(gz,True);before=gz.read_bytes()
+        # A preview ignores them and changes nothing.
+        self.assertEqual(self.run_cli()['planned_files'],1)
+        self.assertEqual(gz.read_bytes(),before)
+        self.assertTrue(plain.exists())
         self.assertEqual(self.run_cli('--apply')['cloned_files'],1)
+        self.assertNotEqual(b.stat().st_ino,old)
         self.assertFalse(plain.exists())
-    def test_migration_rejects_conflicting_versions(self):
-        self.pair();plain=self.root/'.apfs-dedupe.jsonl';gz=self.root/'.apfs-dedupe.jsonl.gz'
-        j=d.Journal(plain,self.root);j.add(event='aborted',id='extra');os.close(j.fd)
-        first=plain.read_bytes().splitlines(keepends=True)[0];gz.write_bytes(gzip.compress(first))
-        before=(plain.read_bytes(),gz.read_bytes())
-        self.assertIn('differ',self.run_cli('--apply',code=1)['message'])
-        self.assertEqual((plain.read_bytes(),gz.read_bytes()),before)
+        header=json.loads(gzip.decompress(gz.read_bytes()).splitlines()[0])
+        self.assertEqual((header['version'],header['volume']),(2,self.native.volume_identity(self.root)))
+        self.assertEqual(self.events(),['header','stage','prepared','done'])
+    def test_uncompressed_journal_at_the_journal_path_is_removed_on_apply(self):
+        self.pair();gz=self.root/'.apfs-dedupe.jsonl.gz'
+        self.old_journal(gz,False)
+        self.assertEqual(self.run_cli()['planned_files'],1)
+        self.assertEqual(self.run_cli('--apply')['cloned_files'],1)
+        self.assertEqual(self.events(),['header','stage','prepared','done'])
     def test_custom_journal_adds_gzip_suffix(self):
         self.pair();path=self.root/'custom.jsonl'
         result=self.run_cli('--apply','--journal',str(path))
@@ -172,19 +178,14 @@ class Tests(unittest.TestCase):
         self.assertFalse(path.exists())
         self.assertTrue(Path(str(path)+'.gz').exists())
         self.assertEqual(self.run_cli('--apply','--journal',str(path))['cloned_files'],0)
-    def test_empty_legacy_journal_migration(self):
-        self.pair();plain=self.root/'.apfs-dedupe.jsonl';plain.touch()
-        self.assertEqual(self.run_cli('--apply')['cloned_files'],1)
-        self.assertFalse(plain.exists())
-        subprocess.run(['/usr/bin/gzip','-t',str(plain)+'.gz'],check=True)
     def test_large_bulk_and_concatenated_members(self):
-        plain=self.root/'.apfs-dedupe.jsonl'
-        header={'event':'header','version':1,'root':str(self.root)}
+        gz=self.root/'.apfs-dedupe.jsonl.gz'
+        os.close(d.Journal(gz,self.root).fd)
+        header=json.loads(gzip.decompress(gz.read_bytes()))
         records=[header]+[{'event':'aborted','id':str(uuid.uuid4()),'description':'long duplicate path/'*20} for _ in range(300)]
         data=b''.join((json.dumps(r,sort_keys=True)+'\n').encode() for r in records)
-        plain.write_bytes(data)
+        gz.write_bytes(gzip.compress(data))
         self.assertEqual(self.run_cli('--apply')['cloned_files'],0)
-        gz=Path(str(plain)+'.gz');self.assertEqual(gzip.decompress(gz.read_bytes()),data)
         self.assertLess(gz.stat().st_size,len(data)//4)
         j=d.Journal(gz,self.root)
         try:
@@ -195,7 +196,7 @@ class Tests(unittest.TestCase):
     def test_concurrent_change_refused(self):
         a,b=self.pair();_,sa=d.hash_file(a);digest,sb=d.hash_file(b)
         b.write_bytes(b'updated')
-        j=d.Journal(self.root/'.apfs-dedupe.jsonl',self.root)
+        j=d.Journal(self.root/'.apfs-dedupe.jsonl.gz',self.root)
         try:
             with self.assertRaises(d.Conflict):d.clone_one(self.native,self.root,a,b,digest,sa,sb,j)
             self.assertEqual(b.read_bytes(),b'updated')
@@ -207,13 +208,12 @@ class Tests(unittest.TestCase):
         self.addCleanup(lambda:(child.kill(),child.wait(),child.stdin.close(),child.stdout.close()))
         self.assertEqual(child.stdout.readline(),'up\n')
         return child
-    def staged(self, journal='.apfs-dedupe.jsonl'):
+    def staged(self, journal='.apfs-dedupe.jsonl.gz'):
         a,b=self.pair();_,sa=d.hash_file(a);digest,sb=d.hash_file(b)
         j=d.Journal(self.root/journal,self.root);self.addCleanup(lambda:os.close(j.fd))
         return a,b,j,d.prepare(self.native,self.root,a,b,digest,sa,sb,j)
-    def events(self, journal='.apfs-dedupe.jsonl'):
-        data=(self.root/journal).read_bytes()
-        return [json.loads(x)['event'] for x in (gzip.decompress(data) if journal.endswith('.gz') else data).splitlines()]
+    def events(self, journal='.apfs-dedupe.jsonl.gz'):
+        return [json.loads(x)['event'] for x in gzip.decompress((self.root/journal).read_bytes()).splitlines()]
     def assert_original_kept(self, b, item, outcome, reason):
         self.assertIsInstance(outcome,d.Skip)
         self.assertEqual(outcome.reason,reason)
@@ -287,7 +287,7 @@ class Tests(unittest.TestCase):
         self.assertEqual((b.read_bytes(),item.tmp.read_bytes()),(a.read_bytes()+b'path',a.read_bytes()+b'held'))
         self.assertEqual(self.events()[-1],'conflict')
         self.doCleanups()
-        self.assertIn('both are kept',self.run_cli('--apply','--journal',str(self.root/'.apfs-dedupe.jsonl'),code=1)['message'])
+        self.assertIn('both are kept',self.run_cli('--apply',code=1)['message'])
         self.assertTrue(item.tmp.exists())
     def test_flock_holder_is_skipped(self):
         a,b,j,item=self.staged();fd=os.open(b,os.O_RDONLY)
